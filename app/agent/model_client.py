@@ -34,7 +34,7 @@ action ::= "explore" | "think" | "act" | "verify" | "visualize" | "respond"
 GRAMMAR_THOUGHT_OUTPUT = r"""
 root ::= thought
 thought ::= "{" ws "\"action\"" ws ":" ws action_value ws "," ws "\"reason\"" ws ":" ws string ws "}"
-action_value ::= "\"" ("explore" | "think" | "act" | "verify" | "visualize" | "respond") "\""
+action_value ::= "\"explore\"" | "\"think\"" | "\"act\"" | "\"verify\"" | "\"visualize\"" | "\"respond\""
 string ::= "\"" (char)* "\""
 char ::= [^"\\] | "\\" ["\\/bfnrt] | "\\u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]
 ws ::= [ \t\n]*
@@ -42,8 +42,9 @@ ws ::= [ \t\n]*
 
 GRAMMAR_CODE_BLOCK = r"""
 root ::= code
-code ::= "{" ws "\"code\"" ws ":" ws string ws "," ws "\"language\"" ws ":" ws ("\"python\"" | "\"sql\"") ws "}"
+code ::= "{" ws "\"code\"" ws ":" ws string ws "," ws "\"language\"" ws ":" ws language ws "}"
 string ::= "\"" (char)* "\""
+language ::= "\"python\"" | "\"sql\""
 char ::= [^"\\\n] | "\\" ["\\/bfnrt] | "\\n" | "\\u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]
 ws ::= [ \t\n]*
 """
@@ -52,16 +53,18 @@ GRAMMAR_VERIFY_RESULT = r"""
 root ::= result
 result ::= "{" ws "\"pass\"" ws ":" ws boolean ws "," ws "\"issues\"" ws ":" ws array ws "}"
 boolean ::= "true" | "false"
-array ::= "[" ws "]" | "[" ws string (ws "," ws string)* ws "]"
+array ::= "[" ws "]" | "[" ws string ws array_tail ws "]"
 string ::= "\"" (char)* "\""
+array_tail ::= "" | "," ws string ws array_tail
 char ::= [^"\\] | "\\" ["\\/bfnrt] | "\\u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]
 ws ::= [ \t\n]*
 """
 
 GRAMMAR_VISUALIZATION_DECISION = r"""
 root ::= decision
-decision ::= "{" ws "\"should_visualize\"" ws ":" ws boolean ws "," ws "\"chart_type\"" ws ":" ws (chart_type | "null") ws "," ws "\"rationale\"" ws ":" ws string ws "}"
+decision ::= "{" ws "\"should_visualize\"" ws ":" ws boolean ws "," ws "\"chart_type\"" ws ":" ws chart_type_or_null ws "," ws "\"rationale\"" ws ":" ws string ws "}"
 boolean ::= "true" | "false"
+chart_type_or_null ::= chart_type | "null"
 chart_type ::= "\"bar\"" | "\"line\"" | "\"scatter\"" | "\"histogram\"" | "\"box\""
 string ::= "\"" (char)* "\""
 char ::= [^"\\] | "\\" ["\\/bfnrt] | "\\u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]

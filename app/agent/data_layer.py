@@ -13,6 +13,11 @@ import os
 from app.config import DUCKDB_MEMORY_LIMIT
 
 
+def _quote_identifier(name: str) -> str:
+    """Quote a SQL identifier for DuckDB (handles names starting with digits)."""
+    return f'"{name}"'
+
+
 class DataLayer:
     """
     Embedded DuckDB wrapper for local data analysis.
@@ -126,10 +131,11 @@ class DataLayer:
         
         Returns list of dicts with keys: column_name, data_type, is_nullable.
         """
+        quoted_table = _quote_identifier(table_name)
         result = self.conn.execute(f"""
             SELECT column_name, data_type, is_nullable
             FROM information_schema.columns
-            WHERE table_name = '{table_name}'
+            WHERE table_name = {quoted_table}
             ORDER BY ordinal_position
         """).fetchall()
         return [
@@ -152,21 +158,23 @@ class DataLayer:
         }
         
         # Get row count
-        row_result = self.conn.execute(f"SELECT COUNT(*) FROM user_data.{table_name}").fetchone()
+        quoted_table = _quote_identifier(table_name)
+        row_result = self.conn.execute(f"SELECT COUNT(*) FROM user_data.{quoted_table}").fetchone()
         profile['row_count'] = row_result[0] if row_result else 0
         
         # Get per-column stats
         for col_info in schema:
             col_name = col_info['column_name']
             col_type = col_info['data_type']
+            quoted_col = _quote_identifier(col_name)
             
             # Build dynamic query for stats
             stats_query = f"""
                 SELECT 
                     COUNT(*) as total,
-                    COUNT({col_name}) as non_null,
-                    COUNT(DISTINCT {col_name}) as distinct_count
-                FROM user_data.{table_name}
+                    COUNT({quoted_col}) as non_null,
+                    COUNT(DISTINCT {quoted_col}) as distinct_count
+                FROM user_data.{quoted_table}
             """
             stats_result = self.conn.execute(stats_query).fetchone()
             
@@ -183,9 +191,9 @@ class DataLayer:
             # Get sample values for categorical/low-cardinality columns
             if col_profile['distinct_count'] <= 20:
                 sample_query = f"""
-                    SELECT DISTINCT {col_name} 
-                    FROM user_data.{table_name} 
-                    WHERE {col_name} IS NOT NULL
+                    SELECT DISTINCT {quoted_col} 
+                    FROM user_data.{quoted_table} 
+                    WHERE {quoted_col} IS NOT NULL
                     LIMIT 10
                 """
                 try:

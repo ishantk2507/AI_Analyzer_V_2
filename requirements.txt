@@ -1,0 +1,18 @@
+# Core dependencies
+streamlit==1.35.0
+langgraph==0.2.10
+langchain-core==0.2.28
+
+# LLM inference (in-process, no daemon)
+llama-cpp-python==0.2.78
+
+# Data engine
+duckdb==1.0.0
+pandas==2.2.2
+pyarrow==16.1.0
+
+# Visualization (headless)
+matplotlib==3.9.0
+
+# Docker SDK for Python
+docker==7.1.0

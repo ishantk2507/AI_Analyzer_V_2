@@ -7,13 +7,17 @@ Change this file to adjust resource limits, timeouts, model settings.
 
 import os
 from pathlib import Path
+from dotenv import load_dotenv
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+load_dotenv(PROJECT_ROOT / ".env")
 
 # === Model Configuration ===
 MODEL_PATH = os.environ.get(
-    'MODEL_PATH',
-    '/models/ministral-3b-instruct-2125-q4_k_m.gguf'
+    'MODEL_PATH'
 )
-MODEL_N_CTX = int(os.environ.get('MODEL_N_CTX', '4096'))
+MODEL_N_CTX = int(os.environ.get('MODEL_N_CTX'))
 MODEL_N_GPU_LAYERS = int(os.environ.get('MODEL_N_GPU_LAYERS', '-1'))  # -1 = offload all
 
 # === DuckDB Configuration ===

@@ -33,3 +33,5 @@ venv/
 .DS_Store
 Thumbs.db
 ```
+ai_analyzer.egg-info/
+models/

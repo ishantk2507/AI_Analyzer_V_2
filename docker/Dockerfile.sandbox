@@ -1,12 +1,9 @@
 FROM python:3.11-slim
 
-# Set environment variables to prevent network calls and reduce footprint
 ENV HF_HUB_OFFLINE=1
-ENV PIP_NO_INDEX=1
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 ENV MPLBACKEND=Agg
 
-# Install system dependencies needed for duckdb, pandas, matplotlib
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libopenblas-dev \
     libblas-dev \
@@ -14,23 +11,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gfortran \
     && rm -rf /var/lib/apt/lists/*
 
-# Install only the required Python packages (pinned versions for reproducibility)
-RUN pip install --no-cache-dir --no-index --find-links=/tmp/wheels \
-    duckdb==1.0.0 \
-    pandas==2.2.2 \
-    matplotlib==3.9.0 \
-    pyarrow==16.1.0 \
-    || pip install --no-cache-dir \
-    duckdb==1.0.0 \
-    pandas==2.2.2 \
-    matplotlib==3.9.0 \
-    pyarrow==16.1.0
+RUN pip install --no-cache-dir \
+    duckdb \
+    pandas \
+    matplotlib \
+    pyarrow
 
-# Create directories for data mount and scratch space
 RUN mkdir -p /data /scratch
 
-# Copy the persistent REPL script
-COPY persistent_repl.py /persistent_repl.py
+COPY docker/persistent_repl.py /persistent_repl.py
 
-# Default command keeps container running; actual work is done via docker exec
 CMD ["tail", "-f", "/dev/null"]

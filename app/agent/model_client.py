@@ -372,7 +372,7 @@ class ModelClient:
                 )
 
             raw_response = response['choices'][0]['text'].strip()
-            logger.debug("Raw response: %s", raw_response[:200])
+            logger.info("Raw response: %s", raw_response[:500])
 
             # Pre-process raw response: strip markdown fences
             raw_response = re.sub(r'^```json\s*', '', raw_response, flags=re.IGNORECASE)
@@ -383,7 +383,7 @@ class ModelClient:
             # Parse JSON from response with newline escaping
             try:
                 result = _parse_json_with_newline_fix(raw_response)
-                logger.debug("Parsed JSON successfully")
+                logger.info("Parsed JSON successfully")
                 return result
             except json.JSONDecodeError as e:
                 logger.error("Failed to parse JSON: %s, raw: %s", e, raw_response)
@@ -449,17 +449,23 @@ Respond with JSON: {{"next": "<action>", "reason": "<brief explanation>"}}"""}
         Generate code for execution (Analyst/Viz nodes).
 
         Returns dict with 'code' and 'language' keys.
+        Logs raw model response for debugging.
         """
         messages = [
             {'role': 'system', 'content': system_prompt},
             {'role': 'user', 'content': f"Data context:\n{data_context}\n\nTask: {task_description}\n\nGenerate code to accomplish this."}
         ]
 
-        return self.generate_structured(
+        result = self.generate_structured(
             messages=messages,
             output_schema='{"code": "string", "language": "python|sql"}',
             grammar=GRAMMAR_CODE_BLOCK,
         )
+        
+        # Log the raw model response for debugging
+        logger.info("generate_code raw response: %s", result)
+        
+        return result
 
     def generate_response(
         self,

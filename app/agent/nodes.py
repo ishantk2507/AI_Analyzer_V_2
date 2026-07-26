@@ -135,6 +135,9 @@ def supervisor_node(state: AgentState, model_client: ModelClient) -> AgentState:
             user_query=state['query']
         )
         
+        # Log the raw model response for debugging
+        logger.info("Supervisor model response: %s", decision)
+        
         next_action = decision.get('next', 'analyze')
         reason = decision.get('reason', 'No reason provided')
         
@@ -274,9 +277,12 @@ def analyst_node(state: AgentState, model_client: ModelClient, sandbox: SandboxC
     # Extract digit-starting columns and add explicit rule
     digit_cols = _extract_digit_starting_columns(state.get('data_profile'))
     if digit_cols:
-        data_context_parts.append(f"\nIMPORTANT: Column names starting with digits MUST be double-quoted in SQL.")
+        data_context_parts.append(f"\nIMPORTANT: Column names starting with digits MUST be enclosed in double quotes in SQL.")
         data_context_parts.append(f"Digit-starting columns found: {', '.join(digit_cols)}")
         data_context_parts.append(f"Example: SELECT \"{digit_cols[0]}\" FROM table_name")
+        data_context_parts.append(f"DO NOT use these columns inside CASE statements. Instead, filter or aggregate them directly.")
+        data_context_parts.append(f"For example, instead of: CASE WHEN \"2WT\" > 0 THEN 1 ELSE 0 END")
+        data_context_parts.append(f"Use direct aggregation: SUM(\"2WT\") or COUNT(*) WHERE \"2WT\" > 0")
     
     if state.get('schema_summary'):
         data_context_parts.append(f"\nSchema Info:\n{state['schema_summary']}")
@@ -289,6 +295,9 @@ def analyst_node(state: AgentState, model_client: ModelClient, sandbox: SandboxC
         task_description=task_description,
         data_context=data_context
     )
+    
+    # Log the raw model response for debugging
+    logger.info("Model raw response: %s", code_result.get('raw', str(code_result)[:500]))
     
     # Handle error response from generate_structured
     if 'error' in code_result:
@@ -344,7 +353,7 @@ def analyst_node(state: AgentState, model_client: ModelClient, sandbox: SandboxC
         pattern = r'(?<!")\b' + re.escape(col_name) + r'\b(?!")'
         code = re.sub(pattern, _quote_sql_identifier(col_name), code)
     
-    logger.debug("Generated code (post-processed):\n%s", code[:500])
+    logger.info("Generated code (post-processed):\n%s", code[:500])
     
     # Execute in sandbox
     execution_result = sandbox.execute(code, timeout=30)
@@ -354,10 +363,14 @@ def analyst_node(state: AgentState, model_client: ModelClient, sandbox: SandboxC
     if error:
         logger.warning("Code execution failed: %s", error)
         findings = f"Execution failed: {error}"
+        # Log the full execution error for debugging
+        logger.info("Full execution error details: %s", execution_result)
     else:
         result_repr = execution_result.get('result_repr', '')
         stdout = execution_result.get('stdout', '')
         findings = result_repr or stdout or "Code executed successfully."
+        # Log the successful execution result for debugging
+        logger.info("Execution result: %s", findings[:500])
     
     # Collect artifacts
     new_artifacts = execution_result.get('artifacts', [])
@@ -404,6 +417,9 @@ def viz_node(state: AgentState, model_client: ModelClient, sandbox: SandboxClien
         data_context=data_context
     )
     
+    # Log the raw model response for debugging
+    logger.info("Viz model response: %s", code_result)
+    
     code = code_result.get('code', '')
     language = code_result.get('language', 'python')
     
@@ -414,11 +430,19 @@ def viz_node(state: AgentState, model_client: ModelClient, sandbox: SandboxClien
             'generated_code': None
         }
     
+    logger.info("Generated viz code:\n%s", code[:500])
+    
     # Execute in sandbox
     execution_result = sandbox.execute(code, timeout=30)
     
     # Collect artifacts
     new_artifacts = execution_result.get('artifacts', [])
+    
+    # Log execution result for debugging
+    if execution_result.get('error'):
+        logger.warning("Viz execution failed: %s", execution_result.get('error'))
+    else:
+        logger.info("Viz execution succeeded, artifacts: %s", new_artifacts)
     
     return {
         'generated_code': code,
@@ -460,7 +484,8 @@ def report_node(state: AgentState, model_client: ModelClient) -> AgentState:
         interpretation=interpretation
     )
     
-    logger.info("Report generated: %s", response[:200])
+    # Log the generated response for debugging
+    logger.info("Report generated: %s", response[:500])
     
     return {
         'findings': findings,
@@ -469,6 +494,6 @@ def report_node(state: AgentState, model_client: ModelClient) -> AgentState:
         'current_action': 'done',
         'conversation_history': state.get('conversation_history', []) + [{
             'role': 'assistant',
-            'content': f"Report: {response[:200]}"
+            'content': f"Report: {response[:500]}"
         }]
     }

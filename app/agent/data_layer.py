@@ -194,19 +194,19 @@ class DataLayer:
                 'sample_values': []
             }
             
-            # Get sample values for categorical/low-cardinality columns
-            if col_profile['distinct_count'] <= 20:
-                sample_query = f"""
-                    SELECT DISTINCT {quoted_col} 
-                    FROM user_data.{quoted_table} 
-                    WHERE {quoted_col} IS NOT NULL
-                    LIMIT 10
-                """
-                try:
-                    samples = self.conn.execute(sample_query).fetchall()
-                    col_profile['sample_values'] = [str(s[0]) for s in samples]
-                except Exception:
-                    pass
+            # Get sample values for ALL columns (not just low-cardinality ones)
+            # This helps the analyst understand what each column contains
+            sample_query = f"""
+                SELECT DISTINCT {quoted_col} 
+                FROM user_data.{quoted_table} 
+                WHERE {quoted_col} IS NOT NULL
+                LIMIT 5
+            """
+            try:
+                samples = self.conn.execute(sample_query).fetchall()
+                col_profile['sample_values'] = [str(s[0]) for s in samples]
+            except Exception:
+                pass
             
             profile['columns'].append(col_profile)
         

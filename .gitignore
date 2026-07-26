@@ -1,3 +1,30 @@
-The file changes consist only of source/config files (.py and .md) with no build artifacts, dependencies, or temporary files that need to be ignored.
+```
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
 
-(No output)
+# Logs and temp files
+*.log
+*.tmp
+
+# Environment
+.env
+.env.local
+*.env.*
+
+# Editors
+.vscode/
+.idea/
+
+# Coverage
+.coverage
+coverage/
+htmlcov/
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+```

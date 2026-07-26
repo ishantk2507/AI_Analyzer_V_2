@@ -288,6 +288,26 @@ def analyst_node(state: AgentState, model_client: ModelClient, sandbox: SandboxC
     if state.get('schema_summary'):
         data_context_parts.append(f"\nSchema Info:\n{state['schema_summary']}")
     
+    # Add sample data examples from data_profile to help analyst understand column contents
+    if state.get('data_profile'):
+        data_context_parts.append("\n\nSAMPLE DATA VALUES (to help you understand what each column contains):")
+        for table_name, profile in state['data_profile'].items():
+            if isinstance(profile, dict) and 'columns' in profile:
+                data_context_parts.append(f"\nTable '{table_name}':")
+                for col in profile['columns'][:15]:  # Show up to 15 columns
+                    if col.get('sample_values'):
+                        samples_str = ', '.join(str(s) for s in col['sample_values'][:5])
+                        data_context_parts.append(f"  - {col['name']} ({col['type']}): Examples = [{samples_str}]")
+                    else:
+                        data_context_parts.append(f"  - {col['name']} ({col['type']})")
+    
+    data_context_parts.append("\n\nCRITICAL CODE FORMATTING RULES:")
+    data_context_parts.append("1. DO NOT include SQL comments (--) in your code - they cause syntax errors when executed")
+    data_context_parts.append("2. Return ONLY the raw SQL query or Python code, NO explanatory text")
+    data_context_parts.append("3. Do NOT use markdown code fences (```) - return plain code only")
+    data_context_parts.append("4. For SQL: start directly with SELECT, WITH, or other SQL keywords")
+    data_context_parts.append("5. NEVER use escaped quotes like \\\" inside SQL strings - use single quotes for strings")
+    
     data_context = "\n".join(data_context_parts)
     
     # Generate code

@@ -51,6 +51,8 @@ When generating code for the `act` node:
 8. **Plain code only**: Return ONLY raw SQL or Python code, NO markdown fences (```), NO explanatory text.
 9. **Start with keywords**: SQL must start directly with SELECT, WITH, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, or DESCRIBE.
 10. **Digit-starting columns**: Column names starting with digits (e.g., `2WT`, `3WT`) MUST be enclosed in double quotes in DuckDB SQL: `"2WT"`.
+11. **Sample data is truth**: ALWAYS examine the SAMPLE DATA VALUES provided in the context to understand what each column contains BEFORE writing queries. Use actual values from samples, not assumed ones.
+12. **NO escaped quotes**: NEVER use escaped double quotes like `\"` inside SQL strings. Use single quotes for string literals in SQL (e.g., `'Two Wheeler'` not `\"Two Wheeler\"`).
 
 **SQL Template:**
 ```sql

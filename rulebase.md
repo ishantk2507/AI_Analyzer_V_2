@@ -47,6 +47,10 @@ When generating code for the `act` node:
 4. **Predicate pushdown**: Filter early in the query.
 5. **Limit results**: Cap output rows to 100 unless explicitly requested otherwise.
 6. **Chart code**: Save plots to `/scratch/` directory as PNG files using matplotlib `Agg` backend.
+7. **NO COMMENTS**: DO NOT include SQL comments (`--`) or Python comments (`#`) in generated code - they cause syntax errors during execution.
+8. **Plain code only**: Return ONLY raw SQL or Python code, NO markdown fences (```), NO explanatory text.
+9. **Start with keywords**: SQL must start directly with SELECT, WITH, INSERT, UPDATE, DELETE, CREATE, DROP, ALTER, or DESCRIBE.
+10. **Digit-starting columns**: Column names starting with digits (e.g., `2WT`, `3WT`) MUST be enclosed in double quotes in DuckDB SQL: `"2WT"`.
 
 **SQL Template:**
 ```sql

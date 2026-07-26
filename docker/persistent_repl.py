@@ -18,8 +18,11 @@ import threading
 import traceback
 import re
 import os
+import logging
 from io import StringIO
 from types import ModuleType
+
+logger = logging.getLogger(__name__)
 
 # Pre-import safe modules for the execution namespace
 import duckdb
@@ -113,11 +116,21 @@ def execute_with_timeout(code: str, namespace: SafeNamespace, timeout_sec: int) 
             code_cleaned = code_cleaned.strip()
             
             # Remove SQL comments from the beginning to properly detect SQL
+            # Also strip leading/trailing whitespace after comment removal
             code_for_detection = re.sub(r'^\s*--.*$', '', code_cleaned, flags=re.MULTILINE).strip()
             code_for_detection_upper = code_for_detection.upper()
             
+            logger.debug("Code detection: first 100 chars of cleaned='%s', after comment removal='%s'", 
+                        code_cleaned[:100], code_for_detection[:100])
+            
             # Check for SQL-like query (heuristic: starts with SQL keywords after stripping comments)
-            if code_for_detection_upper.startswith(('SELECT', 'WITH', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'DROP', 'ALTER', 'DESCRIBE')):
+            is_sql = bool(code_for_detection_upper) and code_for_detection_upper.startswith(
+                ('SELECT', 'WITH', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'DROP', 'ALTER', 'DESCRIBE')
+            )
+            
+            logger.debug("Code detected as SQL: %s", is_sql)
+            
+            if is_sql:
                 # Execute as DuckDB SQL
                 conn = namespace.get('duckdb_conn')
                 if conn is None:

@@ -18,7 +18,7 @@ import re
 from typing import TypedDict, List, Dict, Any, Optional
 from datetime import datetime
 
-from app.agent.model_client import ModelClient
+from app.agent.model_client import ModelClient, _extract_json_fields_regex
 from app.agent.sandbox_client import SandboxClient
 from app.agent.data_layer import DataLayer
 from app.config import AGENT_MAX_ITERATIONS, AGENT_CONTEXT_MAX_TOKENS
@@ -88,6 +88,8 @@ def supervisor_node(state: AgentState, model_client: ModelClient) -> AgentState:
     Does NOT write SQL, code, or verification logic.
     
     Returns: {'current_action': <next>, 'conversation_history': [...]}
+    
+    If model returns unknown action (e.g., "explore"), defaults to "report" to terminate.
     """
     logger.debug("Running supervisor_node, iteration=%d", state.get('iteration_count', 0))
     
@@ -135,6 +137,15 @@ def supervisor_node(state: AgentState, model_client: ModelClient) -> AgentState:
         
         next_action = decision.get('next', 'analyze')
         reason = decision.get('reason', 'No reason provided')
+        
+        # Validate action: only allow known actions
+        valid_actions = {'fetch_data', 'analyze', 'visualize', 'report', 'done'}
+        if next_action not in valid_actions:
+            logger.warning("Supervisor returned invalid action '%s', defaulting to 'report'", next_action)
+            next_action = 'report'
+            reason = f"Invalid action '{next_action}' was returned by model, forcing report to terminate"
+            # Add error to state so we know this happened
+            state.setdefault('errors', []).append(f"Supervisor hallucinated action: {next_action}")
         
         # Hard guardrails
         # If data_profile exists, force next != fetch_data
@@ -279,15 +290,51 @@ def analyst_node(state: AgentState, model_client: ModelClient, sandbox: SandboxC
         data_context=data_context
     )
     
-    code = code_result.get('code', '')
-    language = code_result.get('language', 'python')
+    # Handle error response from generate_structured
+    if 'error' in code_result:
+        logger.warning("Code generation returned error: %s", code_result.get('error'))
+        # Try regex fallback to extract code from raw response
+        raw = code_result.get('raw', '')
+        code = ''
+        language = 'python'
+        
+        if raw:
+            # First try extracting from markdown code block (most reliable for multi-line SQL)
+            code_match = re.search(r'```(?:sql|python)?\s*([\s\S]*?)```', raw, re.IGNORECASE)
+            if code_match:
+                code = code_match.group(1).strip()
+                language = 'sql' if 'SELECT' in code.upper() or 'FROM' in code.upper() else 'python'
+                logger.info("Regex fallback extracted code from markdown block (%d chars)", len(code))
+            
+            # If no markdown block, try field extraction
+            if not code:
+                extracted = _extract_json_fields_regex(raw, ['code', 'language'])
+                if extracted and extracted.get('code'):
+                    code = extracted['code']
+                    language = extracted.get('language', 'python')
+                    logger.info("Regex fallback extracted code from JSON fields (%d chars)", len(code))
+            
+            # Last resort: look for SQL keywords and extract everything that looks like SQL
+            if not code:
+                sql_match = re.search(r'(SELECT[\s\S]*?FROM[\s\S]*?(?:WHERE[\s\S]*?)?)(?:$|\"|\})', raw, re.IGNORECASE)
+                if sql_match:
+                    code = sql_match.group(1).strip()
+                    language = 'sql'
+                    logger.info("Regex fallback extracted SQL query (%d chars)", len(code))
+    else:
+        code = code_result.get('code', '')
+        language = code_result.get('language', 'python')
     
     if not code:
         logger.warning("Code generation returned empty code")
         return {
             'errors': state.get('errors', []) + ['Failed to generate code'],
             'generated_code': None,
-            'findings': 'Code generation failed.'
+            'findings': 'Code generation failed: ' + code_result.get('error', 'Unknown error'),
+            'conversation_history': state.get('conversation_history', []) + [{
+                'role': 'assistant',
+                'content': 'Analyst: Code generation failed.'
+            }]
         }
     
     # Post-process: wrap bare digit-starting column names in double quotes

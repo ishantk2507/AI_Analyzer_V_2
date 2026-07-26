@@ -65,6 +65,101 @@ def _clean_gbnf(grammar: str) -> str:
     return grammar
 
 
+def _parse_json_with_newline_fix(raw_text: str) -> Dict[str, Any]:
+    """
+    Parse JSON from raw text that may contain literal newlines inside string values.
+    
+    The model often returns multi-line strings inside JSON values like:
+        {"code": "-- SQL here\nSELECT ...", "language": "sql"}
+    
+    This function escapes literal newlines inside JSON string delimiters before parsing.
+    
+    Algorithm:
+    1. First try direct parse (fast path for valid JSON)
+    2. If that fails, escape newlines inside JSON string values
+    3. Parse the cleaned JSON
+    """
+    # First try direct parse (fast path)
+    try:
+        return json.loads(raw_text)
+    except json.JSONDecodeError:
+        pass
+    
+    # Escape newlines inside JSON string values
+    # We need to find content between quotes and escape newlines there
+    result = []
+    in_string = False
+    i = 0
+    while i < len(raw_text):
+        char = raw_text[i]
+        
+        if char == '"' and (i == 0 or raw_text[i-1] != '\\'):
+            # Toggle string state
+            in_string = not in_string
+            result.append(char)
+        elif char == '\n' and in_string:
+            # Escape newline inside string
+            result.append('\\n')
+        elif char == '\r' and in_string:
+            # Skip carriage return inside string (already handled by \n)
+            pass
+        else:
+            result.append(char)
+        
+        i += 1
+    
+    cleaned_text = ''.join(result)
+    logger.debug("Cleaned JSON text (escaped newlines): %s", cleaned_text[:200])
+    
+    # Try parsing the cleaned text
+    try:
+        return json.loads(cleaned_text)
+    except json.JSONDecodeError as e:
+        logger.warning("JSON parse failed after newline escaping: %s", e)
+        raise
+
+
+def _extract_json_fields_regex(raw_text: str, field_names: List[str]) -> Optional[Dict[str, str]]:
+    """
+    Extract JSON fields directly from raw text using regex fallback.
+    
+    Used when json.loads() fails but we can still extract key-value pairs.
+    
+    Args:
+        raw_text: Raw model output
+        field_names: List of field names to extract (e.g., ['code', 'language'] or ['next', 'reason'])
+    
+    Returns:
+        Dict with extracted fields, or None if extraction fails
+    """
+    result = {}
+    for field in field_names:
+        # Try multiple patterns for robustness
+        
+        # Pattern 1: Standard quoted value - handles escaped quotes inside
+        pattern1 = rf'"{re.escape(field)}"\s*:\s*"((?:[^"\\]|\\.)*)"'
+        match = re.search(pattern1, raw_text, re.DOTALL | re.IGNORECASE)
+        if match:
+            value = match.group(1)
+            # Unescape common escape sequences
+            value = value.replace('\\n', '\n').replace('\\t', '\t').replace('\\\\', '\\').replace('\\"', '"')
+            result[field] = value
+            logger.debug("Regex (pattern1) extracted %s: %s", field, value[:50])
+            continue
+        
+        # Pattern 2: Multi-line value until next field or closing brace
+        # This catches cases where newlines break the JSON structure
+        pattern2 = rf'"{re.escape(field)}"\s*:\s*"([\s\S]*?)"\s*(?:,|\}})'
+        match = re.search(pattern2, raw_text, re.IGNORECASE)
+        if match:
+            value = match.group(1).strip()
+            result[field] = value
+            logger.debug("Regex (pattern2) extracted %s: %s", field, value[:50])
+            continue
+    
+    return result if result else None
+
+
 def _format_ministral_prompt(messages: List[Dict[str, str]]) -> str:
     """
     Format messages using Ministral/Mistral chat template.
@@ -279,16 +374,24 @@ class ModelClient:
             raw_response = response['choices'][0]['text'].strip()
             logger.debug("Raw response: %s", raw_response[:200])
 
-            # Parse JSON from response
+            # Pre-process raw response: strip markdown fences
+            raw_response = re.sub(r'^```json\s*', '', raw_response, flags=re.IGNORECASE)
+            raw_response = re.sub(r'^```\s*', '', raw_response, flags=re.IGNORECASE)
+            raw_response = re.sub(r'\s*```$', '', raw_response, flags=re.IGNORECASE)
+            raw_response = raw_response.strip()
+
+            # Parse JSON from response with newline escaping
             try:
-                json_match = re.search(r'\{[^{}]*\}', raw_response, re.DOTALL)
-                if json_match:
-                    result = json.loads(json_match.group())
-                    logger.debug("Parsed JSON successfully")
-                    return result
-                return json.loads(raw_response)
+                result = _parse_json_with_newline_fix(raw_response)
+                logger.debug("Parsed JSON successfully")
+                return result
             except json.JSONDecodeError as e:
                 logger.error("Failed to parse JSON: %s, raw: %s", e, raw_response)
+                # Fallback: extract fields via regex
+                fallback_result = _extract_json_fields_regex(raw_response, ['code', 'language', 'next', 'reason'])
+                if fallback_result:
+                    logger.info("Regex fallback succeeded, extracted: %s", fallback_result)
+                    return fallback_result
                 return {'error': f'Failed to parse JSON: {e}', 'raw': raw_response}
         except Exception as e:
             logger.error("generate_structured failed: %s", e)
@@ -305,16 +408,35 @@ class ModelClient:
 
         Returns dict with 'next' and 'reason' keys.
         next ∈ {fetch_data, analyze, visualize, report, done}
+        
+        Temperature is set to 0.1 for deterministic routing.
         """
         messages = [
             {'role': 'system', 'content': system_prompt},
-            {'role': 'user', 'content': f"Context:\n{context}\n\nQuery: {user_query}\n\nWhich specialist should run next?"}
+            {'role': 'user', 'content': f"""Context:
+{context}
+
+Query: {user_query}
+
+Which specialist should run next?
+
+IMPORTANT: You MUST choose one of these 5 actions ONLY:
+- fetch_data: Load dataset schema (only if not already loaded)
+- analyze: Generate and execute SQL/Python code
+- visualize: Create matplotlib charts from findings
+- report: Generate final response to user
+- done: End the conversation
+
+FORBIDDEN actions (DO NOT return these): explore, think, act, verify, route, decide
+
+Respond with JSON: {{"next": "<action>", "reason": "<brief explanation>"}}"""}
         ]
 
         return self.generate_structured(
             messages=messages,
             output_schema='{"next": "fetch_data|analyze|visualize|report|done", "reason": "string"}',
             grammar=GRAMMAR_SUPERVISOR_OUTPUT,
+            temperature=0.1,  # Low temperature for deterministic routing
         )
 
     def generate_code(

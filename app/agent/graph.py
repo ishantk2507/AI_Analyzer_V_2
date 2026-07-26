@@ -1,8 +1,10 @@
 """
-LangGraph state machine wiring the agent nodes.
+LangGraph state machine wiring the supervisor-worker agent nodes.
 
-Implements the think/act/observe/verify loop with conditional routing
-based on verification results and visualization decisions.
+Implements the supervisor pattern where:
+- Supervisor node makes ALL routing decisions
+- Worker nodes (fetch_data, analyst, viz, report) execute their tasks
+- No self-loops on supervisor; workers always return to supervisor
 """
 
 import logging
@@ -11,13 +13,11 @@ from langgraph.graph import StateGraph, END
 
 from app.agent.nodes import (
     AgentState,
-    explore_node,
-    think_node,
-    act_node,
-    observe_node,
-    verify_node,
-    viz_decision_node,
-    respond_node,
+    supervisor_node,
+    data_fetch_node,
+    analyst_node,
+    viz_node,
+    report_node,
 )
 from app.agent.model_client import ModelClient
 from app.agent.sandbox_client import SandboxClient
@@ -28,10 +28,9 @@ logger = logging.getLogger(__name__)
 
 class AgentGraph:
     """
-    LangGraph-based agent orchestrator.
+    LangGraph-based agent orchestrator with supervisor-worker architecture.
 
-    Manages the state machine loop and provides a simple interface
-    for running queries against a connected dataset.
+    Manages the state machine where supervisor routes to specialists.
     """
 
     def __init__(
@@ -82,135 +81,84 @@ class AgentGraph:
         logger.info("Building LangGraph state machine")
 
         # Define node functions with bound dependencies
-        def explore(state: AgentState) -> AgentState:
+        def supervisor(state: AgentState) -> AgentState:
             try:
-                return explore_node(state, self.data_layer)
+                return supervisor_node(state, self.model_client)
             except Exception as e:
-                logger.error("explore_node failed: %s", e)
-                return {'errors': state.get('errors', []) + [f'Explore error: {e}']}
+                logger.error("supervisor_node failed: %s", e)
+                return {'errors': state.get('errors', []) + [f'Supervisor error: {e}'], 'current_action': 'report'}
 
-        def think(state: AgentState) -> AgentState:
+        def fetch_data(state: AgentState) -> AgentState:
             try:
-                return think_node(state, self.model_client)
+                return data_fetch_node(state, self.data_layer)
             except Exception as e:
-                logger.error("think_node failed: %s", e)
-                return {'errors': state.get('errors', []) + [f'Think error: {e}'], 'current_action': 'respond'}
+                logger.error("data_fetch_node failed: %s", e)
+                return {'errors': state.get('errors', []) + [f'Data fetch error: {e}']}
 
-        def act(state: AgentState) -> AgentState:
+        def analyze(state: AgentState) -> AgentState:
             try:
-                return act_node(state, self.model_client, self.sandbox, self.data_layer)
+                return analyst_node(state, self.model_client, self.sandbox, self.data_layer)
             except Exception as e:
-                logger.error("act_node failed: %s", e)
-                return {'errors': state.get('errors', []) + [f'Act error: {e}'], 'generated_code': None}
+                logger.error("analyst_node failed: %s", e)
+                return {'errors': state.get('errors', []) + [f'Analyst error: {e}'], 'generated_code': None, 'findings': 'Analysis failed.'}
 
-        def observe(state: AgentState) -> AgentState:
+        def visualize(state: AgentState) -> AgentState:
             try:
-                return observe_node(state)
+                return viz_node(state, self.model_client, self.sandbox)
             except Exception as e:
-                logger.error("observe_node failed: %s", e)
-                return {'errors': state.get('errors', []) + [f'Observe error: {e}']}
+                logger.error("viz_node failed: %s", e)
+                return {'errors': state.get('errors', []) + [f'Visualization error: {e}']}
 
-        def verify(state: AgentState) -> AgentState:
+        def report(state: AgentState) -> AgentState:
             try:
-                return verify_node(state, self.model_client)
+                return report_node(state, self.model_client)
             except Exception as e:
-                logger.error("verify_node failed: %s", e)
-                return {'verification_result': {'pass': False, 'issues': [f'Verify error: {e}']}, 'current_action': 'think'}
-
-        def viz_decision(state: AgentState) -> AgentState:
-            try:
-                return viz_decision_node(state, self.model_client)
-            except Exception as e:
-                logger.error("viz_decision_node failed: %s", e)
-                return {'visualization_decision': {'should_visualize': False, 'rationale': f'Error: {e}'}, 'current_action': 'respond'}
-
-        def respond(state: AgentState) -> AgentState:
-            try:
-                return respond_node(state, self.model_client)
-            except Exception as e:
-                logger.error("respond_node failed: %s", e)
-                return {'final_response': f"Error generating response: {e}", 'findings': state.get('findings', 'Unknown'), 'interpretation': 'Error occurred during analysis'}
+                logger.error("report_node failed: %s", e)
+                return {'final_response': f"Error generating response: {e}", 'findings': state.get('findings', 'Unknown'), 'interpretation': 'Error occurred during analysis', 'current_action': 'done'}
 
         # Create the graph
         workflow = StateGraph(AgentState)
 
         # Add nodes
-        workflow.add_node("explore", explore)
-        workflow.add_node("think", think)
-        workflow.add_node("act", act)
-        workflow.add_node("observe", observe)
-        workflow.add_node("verify", verify)
-        workflow.add_node("viz_decision", viz_decision)
-        workflow.add_node("respond", respond)
+        workflow.add_node("supervisor", supervisor)
+        workflow.add_node("fetch_data", fetch_data)
+        workflow.add_node("analyst", analyze)
+        workflow.add_node("visualize", visualize)
+        workflow.add_node("report", report)
 
         # Set entry point
-        workflow.set_entry_point("explore")
+        workflow.set_entry_point("supervisor")
 
-        # Define edges with conditional routing
-        # After explore, always go to think
-        workflow.add_edge("explore", "think")
-
-        # After think, route based on action decision
-        def route_from_think(state: AgentState) -> Literal["act", "verify", "viz_decision", "respond", "explore"]:
-            action = state.get('current_action', 'think')
-            logger.debug("route_from_think: action=%s", action)
-            if action == 'act':
-                return 'act'
-            elif action == 'verify':
-                return 'verify'
+        # Define conditional edges from supervisor
+        def route_from_supervisor(state: AgentState) -> Literal["fetch_data", "analyst", "visualize", "report", "__end__"]:
+            action = state.get('current_action', 'analyze')
+            logger.debug("route_from_supervisor: action=%s", action)
+            
+            if action == 'fetch_data':
+                return 'fetch_data'
+            elif action == 'analyze':
+                return 'analyst'
             elif action == 'visualize':
-                return 'viz_decision'  # Map 'visualize' action to 'viz_decision' node
-            elif action == 'respond':
-                return 'respond'
+                return 'visualize'
+            elif action == 'report' or action == 'done':
+                return 'report'
             else:
-                return 'think'  # Default to more thinking
+                # Default to analyst for unknown actions
+                logger.warning("Unknown action '%s', defaulting to analyst", action)
+                return 'analyst'
 
         workflow.add_conditional_edges(
-            source="think",
-            path=route_from_think,
+            source="supervisor",
+            path=route_from_supervisor,
         )
 
-        # After act, always observe
-        workflow.add_edge("act", "observe")
-
-        # After observe, go to verify
-        workflow.add_edge("observe", "verify")
-
-        # After verify, route based on pass/fail
-        def route_from_verify(state: AgentState) -> Literal["think", "viz_decision"]:
-            current = state.get('current_action', 'think')
-            verification = state.get('verification_result', {})
-            passed = verification.get('pass', False)
-            logger.debug("route_from_verify: current=%s, passed=%s", current, passed)
-            if not passed:
-                return 'think'
-            elif current == 'think':
-                return 'think'
-            else:
-                return 'viz_decision'
-
-        workflow.add_conditional_edges(
-            source="verify",
-            path=route_from_verify,
-        )
-
-        # After viz_decision, route based on decision
-        def route_from_viz(state: AgentState) -> Literal["act", "respond"]:
-            decision = state.get('visualization_decision', {})
-            should_viz = decision.get('should_visualize', False)
-            logger.debug("route_from_viz: should_visualize=%s", should_viz)
-            if should_viz:
-                return 'act'  # Generate chart code
-            else:
-                return 'respond'
-
-        workflow.add_conditional_edges(
-            source="viz_decision",
-            path=route_from_viz,
-        )
-
-        # Respond ends the loop
-        workflow.add_edge("respond", END)
+        # Workers always return to supervisor (except report which ends)
+        workflow.add_edge("fetch_data", "supervisor")
+        workflow.add_edge("analyst", "supervisor")
+        workflow.add_edge("visualize", "supervisor")
+        
+        # Report ends the loop
+        workflow.add_edge("report", END)
 
         logger.info("LangGraph state machine built successfully")
         return workflow.compile()
@@ -230,13 +178,12 @@ class AgentGraph:
             'query': query,
             'data_profile': None,
             'table_names': [],
+            'schema_summary': None,
             'conversation_history': [],
             'current_action': '',
             'generated_code': None,
             'code_language': None,
             'execution_result': None,
-            'verification_result': None,
-            'visualization_decision': None,
             'findings': None,
             'interpretation': None,
             'final_response': None,
@@ -274,12 +221,12 @@ class AgentGraph:
             self.sandbox.stop()
             logger.info("Sandbox stopped successfully")
         except Exception as e:
-            logger.error("Failed to stop sandbox: %s", e)
+            logger.warning("Failed to stop sandbox: %s", e)
         try:
             self.data_layer.close()
             logger.info("DataLayer closed successfully")
         except Exception as e:
-            logger.error("Failed to close DataLayer: %s", e)
+            logger.warning("Failed to close DataLayer: %s", e)
 
 
 # Convenience function for Streamlit integration

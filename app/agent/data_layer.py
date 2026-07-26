@@ -18,6 +18,11 @@ def _quote_identifier(name: str) -> str:
     return f'"{name}"'
 
 
+def _quote_literal(name: str) -> str:
+    """Quote a SQL string literal for DuckDB."""
+    return f"'{name}'"
+
+
 class DataLayer:
     """
     Embedded DuckDB wrapper for local data analysis.
@@ -131,11 +136,12 @@ class DataLayer:
         
         Returns list of dicts with keys: column_name, data_type, is_nullable.
         """
-        quoted_table = _quote_identifier(table_name)
+        # Use string literal for table_name comparison in WHERE clause
+        quoted_table_literal = _quote_literal(table_name)
         result = self.conn.execute(f"""
             SELECT column_name, data_type, is_nullable
             FROM information_schema.columns
-            WHERE table_name = {quoted_table}
+            WHERE table_name = {quoted_table_literal}
             ORDER BY ordinal_position
         """).fetchall()
         return [

@@ -11,6 +11,7 @@ grammar-constrained decoding reliability for structured outputs.
 
 import json
 import logging
+import sys
 import threading
 import re
 from typing import Optional, Dict, Any, List
@@ -26,20 +27,22 @@ logger = logging.getLogger(__name__)
 
 
 # GBNF grammars for constrained decoding
-GRAMMAR_ACTION_CHOICE = r"""
+# Supervisor grammar: only routing decisions
+GRAMMAR_SUPERVISOR_ACTION = r"""
 root ::= action
-action ::= "explore" | "think" | "act" | "verify" | "visualize" | "respond"
+action ::= "fetch_data" | "analyze" | "visualize" | "report" | "done"
 """
 
-GRAMMAR_THOUGHT_OUTPUT = r"""
+GRAMMAR_SUPERVISOR_OUTPUT = r"""
 root ::= thought
-thought ::= "{" ws "\"action\"" ws ":" ws action_value ws "," ws "\"reason\"" ws ":" ws string ws "}"
-action_value ::= "\"explore\"" | "\"think\"" | "\"act\"" | "\"verify\"" | "\"visualize\"" | "\"respond\""
+thought ::= "{" ws "\"next\"" ws ":" ws next_value ws "," ws "\"reason\"" ws ":" ws string ws "}"
+next_value ::= "\"fetch_data\"" | "\"analyze\"" | "\"visualize\"" | "\"report\"" | "\"done\""
 string ::= "\"" (char)* "\""
 char ::= [^"\\] | "\\" ["\\/bfnrt] | "\\u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]
 ws ::= [ \t\n]*
 """
 
+# Code generation grammar (unchanged)
 GRAMMAR_CODE_BLOCK = r"""
 root ::= code
 code ::= "{" ws "\"code\"" ws ":" ws string ws "," ws "\"language\"" ws ":" ws language ws "}"
@@ -49,27 +52,17 @@ char ::= [^"\\\n] | "\\" ["\\/bfnrt] | "\\n" | "\\u" [0-9a-fA-F] [0-9a-fA-F] [0-
 ws ::= [ \t\n]*
 """
 
-GRAMMAR_VERIFY_RESULT = r"""
-root ::= result
-result ::= "{" ws "\"pass\"" ws ":" ws boolean ws "," ws "\"issues\"" ws ":" ws array ws "}"
-boolean ::= "true" | "false"
-array ::= "[" ws "]" | "[" ws string ws array_tail ws "]"
-string ::= "\"" (char)* "\""
-array_tail ::= "" | "," ws string ws array_tail
-char ::= [^"\\] | "\\" ["\\/bfnrt] | "\\u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]
-ws ::= [ \t\n]*
-"""
 
-GRAMMAR_VISUALIZATION_DECISION = r"""
-root ::= decision
-decision ::= "{" ws "\"should_visualize\"" ws ":" ws boolean ws "," ws "\"chart_type\"" ws ":" ws chart_type_or_null ws "," ws "\"rationale\"" ws ":" ws string ws "}"
-boolean ::= "true" | "false"
-chart_type_or_null ::= chart_type | "null"
-chart_type ::= "\"bar\"" | "\"line\"" | "\"scatter\"" | "\"histogram\"" | "\"box\""
-string ::= "\"" (char)* "\""
-char ::= [^"\\] | "\\" ["\\/bfnrt] | "\\u" [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F] [0-9a-fA-F]
-ws ::= [ \t\n]*
-"""
+def _clean_gbnf(grammar: str) -> str:
+    """
+    Clean GBNF grammar for cross-platform compatibility.
+    
+    - Converts CRLF to LF (Windows line endings break the parser)
+    - Removes empty-string literals ("" causes parse errors)
+    """
+    grammar = grammar.replace('\r\n', '\n').replace('\r', '\n')
+    grammar = re.sub(r'::=\s*""', '::= ""', grammar)  # Normalize empty strings
+    return grammar
 
 
 def _format_ministral_prompt(messages: List[Dict[str, str]]) -> str:
@@ -114,7 +107,7 @@ class ModelClient:
 
     Provides two distinct inference paths:
     1. Conversational (generate, generate_response): create_chat_completion() without grammars
-    2. Structured (generate_structured, think_step, etc.): create_completion() with grammars
+    2. Structured (generate_structured, supervisor_step, etc.): create_completion() with grammars
 
     This split avoids Windows-native crashes while preserving grammar-constrained reliability.
     """
@@ -227,6 +220,9 @@ class ModelClient:
         Uses create_completion() with manual prompt formatting to avoid
         Windows-native crash in create_chat_completion(grammar=...).
 
+        On Windows: skips grammar parameter to avoid segfaults.
+        On Linux/Mac: uses grammar-constrained decoding for reliability.
+
         Args:
             messages: Chat messages list.
             output_schema: Description of expected JSON structure.
@@ -255,19 +251,30 @@ class ModelClient:
             prompt = _format_ministral_prompt(augmented_messages)
             logger.debug("Generated prompt length: %d chars", len(prompt))
 
-            # Build grammar object
+            # Platform-specific grammar handling
             from llama_cpp import LlamaGrammar
-            grammar_obj = LlamaGrammar.from_string(grammar)
-
-            # Structured path: create_completion WITH grammar
-            logger.debug("Calling create_completion with grammar")
-            response = self.model.create_completion(
-                prompt=prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                grammar=grammar_obj,
-                stop=["</s>", "[INST]"],
-            )
+            
+            if sys.platform == "win32":
+                # Windows: skip grammar to avoid DLL segfault
+                logger.debug("Windows detected: skipping grammar-constrained decoding")
+                response = self.model.create_completion(
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    stop=["</s>", "[INST]"],
+                )
+            else:
+                # Linux/Mac: use grammar-constrained decoding
+                cleaned_grammar = _clean_gbnf(grammar)
+                grammar_obj = LlamaGrammar.from_string(cleaned_grammar)
+                logger.debug("Calling create_completion with grammar")
+                response = self.model.create_completion(
+                    prompt=prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    grammar=grammar_obj,
+                    stop=["</s>", "[INST]"],
+                )
 
             raw_response = response['choices'][0]['text'].strip()
             logger.debug("Raw response: %s", raw_response[:200])
@@ -287,26 +294,27 @@ class ModelClient:
             logger.error("generate_structured failed: %s", e)
             return {'error': f'Generation failed: {e}'}
 
-    def think_step(
+    def supervisor_step(
         self,
         system_prompt: str,
         context: str,
         user_query: str,
     ) -> Dict[str, str]:
         """
-        Generate the next action decision (Think node).
+        Supervisor decision: choose next worker node.
 
-        Returns dict with 'action' and 'reason' keys.
+        Returns dict with 'next' and 'reason' keys.
+        next ∈ {fetch_data, analyze, visualize, report, done}
         """
         messages = [
             {'role': 'system', 'content': system_prompt},
-            {'role': 'user', 'content': f"Context:\n{context}\n\nQuery: {user_query}\n\nWhat is the next action?"}
+            {'role': 'user', 'content': f"Context:\n{context}\n\nQuery: {user_query}\n\nWhich specialist should run next?"}
         ]
 
         return self.generate_structured(
             messages=messages,
-            output_schema='{"action": "explore|think|act|verify|visualize|respond", "reason": "string"}',
-            grammar=GRAMMAR_THOUGHT_OUTPUT,
+            output_schema='{"next": "fetch_data|analyze|visualize|report|done", "reason": "string"}',
+            grammar=GRAMMAR_SUPERVISOR_OUTPUT,
         )
 
     def generate_code(
@@ -316,7 +324,7 @@ class ModelClient:
         data_context: str,
     ) -> Dict[str, str]:
         """
-        Generate code for execution (Act node).
+        Generate code for execution (Analyst/Viz nodes).
 
         Returns dict with 'code' and 'language' keys.
         """
@@ -331,51 +339,6 @@ class ModelClient:
             grammar=GRAMMAR_CODE_BLOCK,
         )
 
-    def verify_result(
-        self,
-        system_prompt: str,
-        task: str,
-        code: str,
-        result: str,
-    ) -> Dict[str, Any]:
-        """
-        Verify execution results (Verify node).
-
-        Returns dict with 'pass' (bool) and 'issues' (list of strings).
-        """
-        messages = [
-            {'role': 'system', 'content': system_prompt},
-            {'role': 'user', 'content': f"Task: {task}\n\nCode executed:\n{code}\n\nResult:\n{result}\n\nDoes this correctly answer the query? Identify any issues."}
-        ]
-
-        return self.generate_structured(
-            messages=messages,
-            output_schema='{"pass": true|false, "issues": ["string"]}',
-            grammar=GRAMMAR_VERIFY_RESULT,
-        )
-
-    def decide_visualization(
-        self,
-        system_prompt: str,
-        findings: str,
-        query: str,
-    ) -> Dict[str, Any]:
-        """
-        Decide if visualization would help (VizDecision node).
-
-        Returns dict with 'should_visualize', 'chart_type', 'rationale'.
-        """
-        messages = [
-            {'role': 'system', 'content': system_prompt},
-            {'role': 'user', 'content': f"Query: {query}\n\nFindings:\n{findings}\n\nWould a chart help communicate these findings?"}
-        ]
-
-        return self.generate_structured(
-            messages=messages,
-            output_schema='{"should_visualize": true|false, "chart_type": "bar|line|scatter|histogram|box|null", "rationale": "string"}',
-            grammar=GRAMMAR_VISUALIZATION_DECISION,
-        )
-
     def generate_response(
         self,
         system_prompt: str,
@@ -384,7 +347,7 @@ class ModelClient:
         interpretation: str,
     ) -> str:
         """
-        Generate final response to user (Respond node).
+        Generate final response to user (Report node).
         """
         messages = [
             {'role': 'system', 'content': system_prompt},

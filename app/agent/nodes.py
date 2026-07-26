@@ -307,6 +307,8 @@ def analyst_node(state: AgentState, model_client: ModelClient, sandbox: SandboxC
     data_context_parts.append("3. Do NOT use markdown code fences (```) - return plain code only")
     data_context_parts.append("4. For SQL: start directly with SELECT, WITH, or other SQL keywords")
     data_context_parts.append("5. NEVER use escaped quotes like \\\" inside SQL strings - use single quotes for strings")
+    data_context_parts.append("6. When generating JSON output, escape newlines in string values as \\n (not literal newlines)")
+    data_context_parts.append("7. For DuckDB SQL: Use double quotes for identifiers (\"2WT\"), single quotes for string literals ('Two Wheeler')")
     
     data_context = "\n".join(data_context_parts)
     
@@ -373,6 +375,10 @@ def analyst_node(state: AgentState, model_client: ModelClient, sandbox: SandboxC
         # Match the column name when NOT preceded by a double quote
         pattern = r'(?<!")\b' + re.escape(col_name) + r'\b(?!")'
         code = re.sub(pattern, _quote_sql_identifier(col_name), code)
+    
+    # CRITICAL FIX: Unescape any escaped double quotes (\" -> ")
+    # The model often escapes quotes for JSON, but DuckDB needs actual double quotes
+    code = code.replace('\\"', '"')
     
     logger.info("Generated code (post-processed):\n%s", code[:500])
     

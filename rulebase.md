@@ -53,6 +53,8 @@ When generating code for the `act` node:
 10. **Digit-starting columns**: Column names starting with digits (e.g., `2WT`, `3WT`) MUST be enclosed in double quotes in DuckDB SQL: `"2WT"`.
 11. **Sample data is truth**: ALWAYS examine the SAMPLE DATA VALUES provided in the context to understand what each column contains BEFORE writing queries. Use actual values from samples, not assumed ones.
 12. **NO escaped quotes**: NEVER use escaped double quotes like `\"` inside SQL strings. Use single quotes for string literals in SQL (e.g., `'Two Wheeler'` not `\"Two Wheeler\"`).
+13. **JSON newlines**: When generating JSON output, escape literal newlines in string values as `\n`. Do NOT include raw line breaks inside JSON strings.
+14. **DuckDB identifier rules**: Double quotes are ONLY for identifiers (column/table names). Single quotes are ONLY for string literals. Never mix them.
 
 **SQL Template:**
 ```sql

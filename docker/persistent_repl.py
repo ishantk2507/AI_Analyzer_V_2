@@ -106,9 +106,18 @@ def execute_with_timeout(code: str, namespace: SafeNamespace, timeout_sec: int) 
             sys.stdout = stdout_capture
             sys.stderr = stderr_capture
             
-            # Check for SQL-like query (simple heuristic: starts with SELECT, WITH, etc.)
-            code_stripped = code.strip().upper()
-            if code_stripped.startswith(('SELECT', 'WITH', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'DROP')):
+            # Strip markdown code fences if present
+            code_cleaned = code.strip()
+            code_cleaned = re.sub(r'^```(?:sql|python)?\s*', '', code_cleaned, flags=re.IGNORECASE)
+            code_cleaned = re.sub(r'\s*```$', '', code_cleaned, flags=re.IGNORECASE)
+            code_cleaned = code_cleaned.strip()
+            
+            # Remove SQL comments from the beginning to properly detect SQL
+            code_for_detection = re.sub(r'^\s*--.*$', '', code_cleaned, flags=re.MULTILINE).strip()
+            code_for_detection_upper = code_for_detection.upper()
+            
+            # Check for SQL-like query (heuristic: starts with SQL keywords after stripping comments)
+            if code_for_detection_upper.startswith(('SELECT', 'WITH', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'DROP', 'ALTER', 'DESCRIBE')):
                 # Execute as DuckDB SQL
                 conn = namespace.get('duckdb_conn')
                 if conn is None:
@@ -116,11 +125,11 @@ def execute_with_timeout(code: str, namespace: SafeNamespace, timeout_sec: int) 
                     namespace['duckdb_conn'] = conn
                 
                 # Execute SQL and capture result
-                df_result = conn.execute(code).fetchdf()
+                df_result = conn.execute(code_cleaned).fetchdf()
                 execution_result[0] = df_result
             else:
                 # Execute as Python code
-                exec(code, namespace)
+                exec(code_cleaned, namespace)
                 # Get last expression result if any
                 execution_result[0] = namespace.get('_')
                 

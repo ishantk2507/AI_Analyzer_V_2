@@ -282,7 +282,8 @@ def analyst_node(state: AgentState, model_client: ModelClient, sandbox: SandboxC
         data_context_parts.append(f"Example: SELECT \"{digit_cols[0]}\" FROM table_name")
         data_context_parts.append(f"DO NOT use these columns inside CASE statements. Instead, filter or aggregate them directly.")
         data_context_parts.append(f"For example, instead of: CASE WHEN \"2WT\" > 0 THEN 1 ELSE 0 END")
-        data_context_parts.append(f"Use direct aggregation: SUM(\"2WT\") or COUNT(*) WHERE \"2WT\" > 0")
+        data_context_parts.append("Use direct aggregation: SUM(\"2WT\") or COUNT(*) WHERE \"2WT\" > 0")
+        data_context_parts.append("CRITICAL DUCKDB RULE: Never use digit-starting column names inside string literals. Use them as quoted identifiers only.")
     
     if state.get('schema_summary'):
         data_context_parts.append(f"\nSchema Info:\n{state['schema_summary']}")

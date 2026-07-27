@@ -55,6 +55,20 @@ Each dataset contains exactly one additional dimension:
 | Manufacturer-wise Dataset | `MAKER` |
 | Emission Norm-wise Dataset | `NORMS` |
 
+### SQL Table Naming Rules (CRITICAL)
+
+When writing SQL queries, you MUST use these exact table names with the `user_data.` prefix:
+
+- `user_data.vehicle_registrations` — for vehicle type analysis
+- `user_data.fuel_wise_registrations` — for fuel type analysis  
+- `user_data.manufacturer_wise_registrations` — for manufacturer analysis
+- `user_data.emission_norm_registrations` — for emission norm analysis
+
+**NEVER use**: `Vehicle_Registrations`, `vehicle-registrations`, `vehicleregistrations`, or any other variation.
+**ALWAYS use**: lowercase with underscores, prefixed with `user_data.`
+
+**IMPORTANT**: If you make a mistake and use the wrong table name, the system will automatically correct it using the error message. DuckDB will suggest the correct table name in the format "Did you mean user_data.vehicle_registrations?" — use this suggestion directly.
+
 ### Current Vehicle Registration Dataset Statistics
 
 | Property | Value |

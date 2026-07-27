@@ -174,7 +174,17 @@ def thinker_node(state: AgentState, model_client: ModelClient) -> AgentState:
         if action == 'extract':
             if last_error and 'does not exist' in str(last_error):
                 real_tables = state.get('table_names', [])
-                feedback = f"Use ONLY these tables: {real_tables}. Do not invent names."
+                # Extract the correct table name from the error message if available
+                did_you_mean = ""
+                if "Did you mean" in str(last_error):
+                    match = re.search(r'Did you mean "([^"]+)"', str(last_error))
+                    if match:
+                        suggested_table = match.group(1)
+                        # Extract just the table name without schema prefix
+                        if '.' in suggested_table:
+                            suggested_table = suggested_table.split('.')[-1]
+                        did_you_mean = f" Use the table '{suggested_table}' (suggested by database)."
+                feedback = f"Use ONLY these tables: {real_tables}.{did_you_mean} Do not invent names."
             else:
                 feedback = "Extract data using SQL. Filter rows, select columns. No aggregation."
         
@@ -487,18 +497,29 @@ def report_node(state: AgentState, model_client: ModelClient) -> AgentState:
 def _fix_table_references(sql: str, table_names: List[str]) -> str:
     """Rewrite hallucinated/malformed table names to the real registered table.
     Small local models frequently ignore explicit naming instructions —
-    correct deterministically rather than re-prompting."""
+    correct deterministically rather than re-prompting.
+    
+    This function handles multiple variations:
+    - Vehicle_Registrations → user_data.vehicle_registrations
+    - vehicle-registrations → user_data.vehicle_registrations
+    - vehicleregistrations → user_data.vehicle_registrations
+    - Any case/separator variation that normalizes to the same key
+    """
     if not table_names:
         return sql
-
-    norm_lookup = {t.lower().replace('_', ''): t for t in table_names}
-
+    
+    # Build lookup: normalized name (no separators, lowercase) → actual table name
+    norm_lookup = {re.sub(r'[\s_-]', '', t).lower(): t for t in table_names}
+    
     def replace_ref(m):
         keyword, raw_name = m.group(1), m.group(2)
+        # Strip schema prefix and quotes/backticks
         clean = raw_name.split('.')[-1].strip('"\'`')
-        key = clean.lower().replace('_', '')
+        # Normalize: lowercase, remove ALL separators (underscore, hyphen, space)
+        key = re.sub(r'[\s_-]', '', clean).lower()
         if key in norm_lookup:
             return f'{keyword} user_data.{norm_lookup[key]}'
         return m.group(0)
-
-    return re.sub(r'\b(FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_.]*)', replace_ref, sql, flags=re.IGNORECASE)
+    
+    # Match FROM or JOIN followed by table name (with optional schema prefix, allowing hyphens)
+    return re.sub(r'\b(FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_.-]*)', replace_ref, sql, flags=re.IGNORECASE)

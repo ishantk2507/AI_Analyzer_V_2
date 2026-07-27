@@ -69,6 +69,8 @@ When writing SQL queries, you MUST use these exact table names with the `user_da
 
 **IMPORTANT**: If you make a mistake and use the wrong table name, the system will automatically correct it using the error message. DuckDB will suggest the correct table name in the format "Did you mean user_data.vehicle_registrations?" — use this suggestion directly.
 
+**CRITICAL REMINDER**: The table name is ALWAYS lowercase (`vehicle_registrations`), NEVER capitalized (`Vehicle_Registrations`). If you see an error mentioning "Vehicle_Registrations does not exist", immediately change it to `user_data.vehicle_registrations` (all lowercase).
+
 ### Current Vehicle Registration Dataset Statistics
 
 | Property | Value |
@@ -123,6 +125,9 @@ PHASE 1 — SQL EXTRACTION:
 Write minimal DuckDB SQL to load relevant data into a pandas DataFrame.
 - SQL Rules:
   - Use ONLY tables and columns from the provided schema.
+  - **CRITICAL TABLE NAMING RULE**: Table names MUST be lowercase with underscores, prefixed with `user_data.`
+    - CORRECT: `user_data.vehicle_registrations` (all lowercase)
+    - WRONG: `Vehicle_Registrations`, `VEHICLE_REGISTRATIONS`, `vehicle-registrations`
   - Column names starting with a digit (e.g., 2WT, 3WT) MUST be double-quoted: SELECT "2WT" FROM ...
   - Only filter rows and select columns. NO complex aggregations, NO GROUP BY, NO window functions in SQL.
   - The SQL result is stored in a pandas DataFrame named `df`.

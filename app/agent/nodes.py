@@ -183,8 +183,10 @@ def thinker_node(state: AgentState, model_client: ModelClient) -> AgentState:
                         # Extract just the table name without schema prefix
                         if '.' in suggested_table:
                             suggested_table = suggested_table.split('.')[-1]
-                        did_you_mean = f" Use the table '{suggested_table}' (suggested by database)."
-                feedback = f"Use ONLY these tables: {real_tables}.{did_you_mean} Do not invent names."
+                        did_you_mean = f" Use the table '{suggested_table}' (suggested by database). THIS IS THE CORRECT NAME - USE IT EXACTLY."
+                
+                # CRITICAL: Emphasize lowercase requirement
+                feedback = f"TABLE NAME ERROR! Use ONLY lowercase table names: {real_tables}.{did_you_mean} NEVER use capitalized names like 'Vehicle_Registrations'. ALWAYS use 'user_data.vehicle_registrations' (all lowercase)."
             else:
                 feedback = "Extract data using SQL. Filter rows, select columns. No aggregation."
         
@@ -504,6 +506,10 @@ def _fix_table_references(sql: str, table_names: List[str]) -> str:
     - vehicle-registrations → user_data.vehicle_registrations
     - vehicleregistrations → user_data.vehicle_registrations
     - Any case/separator variation that normalizes to the same key
+    
+    CRITICAL: Also handles cases where the model omits the schema prefix
+    or uses incorrect casing like "Vehicle_Registrations" instead of
+    "user_data.vehicle_registrations".
     """
     if not table_names:
         return sql
@@ -522,4 +528,6 @@ def _fix_table_references(sql: str, table_names: List[str]) -> str:
         return m.group(0)
     
     # Match FROM or JOIN followed by table name (with optional schema prefix, allowing hyphens)
-    return re.sub(r'\b(FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_.-]*)', replace_ref, sql, flags=re.IGNORECASE)
+    sql = re.sub(r'\b(FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_.-]*)', replace_ref, sql, flags=re.IGNORECASE)
+    
+    return sql

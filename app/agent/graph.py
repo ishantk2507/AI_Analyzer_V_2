@@ -18,11 +18,11 @@ from app.agent.nodes import (
     analyst_node,
     viz_node,
     report_node,
+    get_agent_max_iterations,
 )
 from app.agent.model_client import ModelClient
 from app.agent.sandbox_client import SandboxClient
 from app.agent.data_layer import DataLayer
-from app.config import AGENT_MAX_ITERATIONS
 
 
 logger = logging.getLogger(__name__)
@@ -164,7 +164,8 @@ class AgentGraph:
             iteration = state.get('iteration_count', 0)
             
             # Hard stop if max iterations hit
-            if iteration >= AGENT_MAX_ITERATIONS:
+            max_iterations = get_agent_max_iterations()
+            if iteration >= max_iterations:
                 logger.warning("Max iterations hit in routing, forcing END")
                 return 'report'  # Route to report to explain failure
             

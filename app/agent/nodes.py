@@ -19,7 +19,7 @@ from datetime import datetime
 from app.agent.model_client import ModelClient, _extract_json_fields_regex
 from app.agent.sandbox_client import SandboxClient
 from app.agent.data_layer import DataLayer
-from app.config import AGENT_MAX_ITERATIONS, RULEBASE_PATH
+from app.config import RULEBASE_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -59,8 +59,38 @@ def _parse_max_iterations(rulebase_text: str, default: int = 6) -> int:
     m = re.search(r'Max iterations:\s*(\d+)', rulebase_text)
     return int(m.group(1)) if m else default
 
-RULEBASE = load_rulebase()
-AGENT_MAX_ITERATIONS = _parse_max_iterations(RULEBASE)
+
+# Global cache for rulebase with file modification time tracking
+_rulebase_cache = {"content": "", "mtime": 0.0}
+
+def get_rulebase() -> str:
+    """
+    Get the current rulebase content, reloading if the file has changed.
+    
+    This enables hot-reloading: any edits to rulebase.md are picked up
+    automatically on the next query without restarting the application.
+    """
+    global _rulebase_cache
+    
+    try:
+        current_mtime = RULEBASE_PATH.stat().st_mtime if RULEBASE_PATH.exists() else 0.0
+        
+        if current_mtime != _rulebase_cache["mtime"]:
+            # File has changed, reload it
+            _rulebase_cache["content"] = load_rulebase()
+            _rulebase_cache["mtime"] = current_mtime
+            logger.info("Rulebase reloaded due to file change")
+        
+        return _rulebase_cache["content"]
+    except Exception as e:
+        logger.warning("Failed to check rulebase file status: %s", e)
+        return _rulebase_cache["content"] or load_rulebase()
+
+
+def get_agent_max_iterations() -> int:
+    """Get the current max iterations from rulebase, with hot-reload support."""
+    rulebase = get_rulebase()
+    return _parse_max_iterations(rulebase)
 
 def _extract_digit_starting_columns(data_profile: Optional[Dict[str, Any]]) -> List[str]:
     """Extract column names that start with digits from the data profile."""
@@ -109,7 +139,8 @@ def thinker_node(state: AgentState, model_client: ModelClient) -> AgentState:
 
     # Call LLM
     try:
-        decision = model_client.thinker_decide(RULEBASE, context)
+        rulebase = get_rulebase()
+        decision = model_client.thinker_decide(rulebase, context)
         logger.info("=== THINKER RAW OUTPUT ===\n%s", decision)
     except Exception as e:
         logger.error("Thinker LLM call failed: %s", e)
@@ -129,14 +160,15 @@ def thinker_node(state: AgentState, model_client: ModelClient) -> AgentState:
         action = 'analyze'
     
     # Guardrail 3: MAX ITERATIONS CHECK (HAPPENS LAST - OVERRIDES ALL)
-    if iteration >= AGENT_MAX_ITERATIONS:
-        logger.warning("Max iterations (%d) reached. Forcing 'report' to terminate.", AGENT_MAX_ITERATIONS)
+    max_iterations = get_agent_max_iterations()
+    if iteration >= max_iterations:
+        logger.warning("Max iterations (%d) reached. Forcing 'report' to terminate.", max_iterations)
         action = 'report'  # Explicitly route to report to explain failure
         reason = "Max iterations reached"
 
     # Construct feedback in Python (NOT LLM)
     feedback = None
-    if action in ('extract', 'analyze') and iteration < AGENT_MAX_ITERATIONS:
+    if action in ('extract', 'analyze') and iteration < max_iterations:
         last_error = (state.get('execution_result') or {}).get('error', '')
         
         if action == 'extract':
@@ -200,7 +232,8 @@ def analyst_node(state: AgentState, model_client: ModelClient, sandbox: SandboxC
 
     # CALL ANALYST GENERATE (Two-Phase Schema)
     try:
-        result = model_client.analyst_generate(RULEBASE, context)
+        rulebase = get_rulebase()
+        result = model_client.analyst_generate(rulebase, context)
         logger.info("=== ANALYST RAW OUTPUT ===\n%s", result)
     except Exception as e:
         logger.error("Analyst LLM call failed: %s", e)
@@ -374,7 +407,8 @@ def viz_node(state: AgentState, model_client: ModelClient, sandbox: SandboxClien
 
     data_context = "Use matplotlib for plotting. Save figures to /scratch/ directory."
 
-    code_result = model_client.generate_code(RULEBASE, task_description, data_context)
+    rulebase = get_rulebase()
+    code_result = model_client.generate_code(rulebase, task_description, data_context)
     logger.info("Viz model response: %s", code_result)
 
     code = code_result.get('code', '')
@@ -428,8 +462,9 @@ def report_node(state: AgentState, model_client: ModelClient) -> AgentState:
 
     # Generate response (No follow-up questions instruction)
     try:
+        rulebase = get_rulebase()
         response = model_client.generate_response(
-            system_prompt=RULEBASE,
+            system_prompt=rulebase,
             query=query,
             findings=findings,
             interpretation=interpretation

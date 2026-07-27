@@ -1,1 +1,20 @@
-Nothing should be ignored since the changes only include source code files (.py files) without any build artifacts, dependencies, or temporary files.
+```
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+.env.*
+
+models/
+logs/
+
+venv/
+ai_analyzer.egg-info/

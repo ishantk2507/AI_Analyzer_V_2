@@ -18,6 +18,11 @@ def _quote_identifier(name: str) -> str:
     return f'"{name}"'
 
 
+def _quote_literal(name: str) -> str:
+    """Quote a SQL string literal for DuckDB."""
+    return f"'{name}'"
+
+
 class DataLayer:
     """
     Embedded DuckDB wrapper for local data analysis.
@@ -131,11 +136,12 @@ class DataLayer:
         
         Returns list of dicts with keys: column_name, data_type, is_nullable.
         """
-        quoted_table = _quote_identifier(table_name)
+        # Use string literal for table_name comparison in WHERE clause
+        quoted_table_literal = _quote_literal(table_name)
         result = self.conn.execute(f"""
             SELECT column_name, data_type, is_nullable
             FROM information_schema.columns
-            WHERE table_name = {quoted_table}
+            WHERE table_name = {quoted_table_literal}
             ORDER BY ordinal_position
         """).fetchall()
         return [
@@ -188,19 +194,19 @@ class DataLayer:
                 'sample_values': []
             }
             
-            # Get sample values for categorical/low-cardinality columns
-            if col_profile['distinct_count'] <= 20:
-                sample_query = f"""
-                    SELECT DISTINCT {quoted_col} 
-                    FROM user_data.{quoted_table} 
-                    WHERE {quoted_col} IS NOT NULL
-                    LIMIT 10
-                """
-                try:
-                    samples = self.conn.execute(sample_query).fetchall()
-                    col_profile['sample_values'] = [str(s[0]) for s in samples]
-                except Exception:
-                    pass
+            # Get sample values for ALL columns (not just low-cardinality ones)
+            # This helps the analyst understand what each column contains
+            sample_query = f"""
+                SELECT DISTINCT {quoted_col} 
+                FROM user_data.{quoted_table} 
+                WHERE {quoted_col} IS NOT NULL
+                LIMIT 5
+            """
+            try:
+                samples = self.conn.execute(sample_query).fetchall()
+                col_profile['sample_values'] = [str(s[0]) for s in samples]
+            except Exception:
+                pass
             
             profile['columns'].append(col_profile)
         

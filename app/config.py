@@ -32,7 +32,7 @@ SANDBOX_TIMEOUT_DEFAULT = int(os.environ.get('SANDBOX_TIMEOUT_DEFAULT', '10'))
 SANDBOX_TIMEOUT_MAX = int(os.environ.get('SANDBOX_TIMEOUT_MAX', '60'))
 
 # === LangGraph / Agent Configuration ===
-AGENT_MAX_ITERATIONS = int(os.environ.get('AGENT_MAX_ITERATIONS', '10'))
+AGENT_MAX_ITERATIONS = int(os.environ.get('AGENT_MAX_ITERATIONS', '6'))
 AGENT_CONTEXT_MAX_TOKENS = int(os.environ.get('AGENT_CONTEXT_MAX_TOKENS', '3000'))
 
 # === Paths ===
@@ -41,9 +41,12 @@ DOCKER_DIR = PROJECT_ROOT / 'docker'
 DATA_MOUNT_DEFAULT = os.environ.get('DATA_MOUNT_DEFAULT', '/tmp/data_mount')
 SCRATCH_MOUNT_DEFAULT = os.environ.get('SCRATCH_MOUNT_DEFAULT', '/tmp/scratch_mount')
 
+RULEBASE_PATH = PROJECT_ROOT / 'rulebase.md'
+
 # === Environment flags for offline operation ===
 os.environ['HF_HUB_OFFLINE'] = '1'
 os.environ['PIP_NO_INDEX'] = '1'
 os.environ['PIP_DISABLE_PIP_VERSION_CHECK'] = '1'
 os.environ['MPLBACKEND'] = 'Agg'
 os.environ['NO_COLOR'] = '1'
+

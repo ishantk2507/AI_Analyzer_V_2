@@ -1,15 +1,13 @@
 """
 LangGraph agent nodes for the supervisor-worker architecture.
 
-Each node is a function that takes the current state and returns updates.
-Nodes are wired together in graph.py to form the complete agent loop.
-
-Agent Roles:
-1. Supervisor: Routes to specialists (fetch_data, analyze, visualize, report, done)
-2. Data Fetch: Loads dataset schema and profiles tables (pure Python, no LLM)
-3. Analyst: Generates SQL/Python code, executes in sandbox
-4. Visualization: Generates matplotlib charts
-5. Reporting: Generates final natural language response
+FIXES APPLIED:
+1. Analyst Node: Implements TRUE two-phase execution (SQL → df → Python).
+   - Calls analyst_generate() for {sql, python} schema.
+   - Executes SQL via DataLayer to populate 'df'.
+   - Injects 'df' into sandbox for Python execution.
+2. Thinker Node: Fixed guardrail ordering. Max iterations now forces 'report' explicitly.
+3. Report Node: Removed hallucinated follow-up questions. Strictly summarizes findings.
 """
 
 import json
@@ -21,7 +19,7 @@ from datetime import datetime
 from app.agent.model_client import ModelClient, _extract_json_fields_regex
 from app.agent.sandbox_client import SandboxClient
 from app.agent.data_layer import DataLayer
-from app.config import AGENT_MAX_ITERATIONS, AGENT_CONTEXT_MAX_TOKENS
+from app.config import AGENT_MAX_ITERATIONS, RULEBASE_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +32,7 @@ class AgentState(TypedDict):
     schema_summary: Optional[str]
     conversation_history: List[Dict[str, str]]
     current_action: str
-    generated_code: Optional[str]
+    generated_code: Optional[Dict[str, str]]  # Changed to dict {sql, python}
     code_language: Optional[str]
     execution_result: Optional[Dict[str, Any]]
     findings: Optional[str]
@@ -43,29 +41,33 @@ class AgentState(TypedDict):
     iteration_count: int
     errors: List[str]
     artifacts: List[str]
+    success: bool
+    analyst_feedback: Optional[str]
+    thinker_reason: Optional[str]
 
 
 def load_rulebase() -> str:
     """Load the rulebase.md file as system prompt."""
-    from pathlib import Path
-    rulebase_path = Path(__file__).parent.parent.parent / 'rulebase.md'
-    if rulebase_path.exists():
-        content = rulebase_path.read_text()
-        logger.info("Rulebase loaded from %s (%d chars)", rulebase_path, len(content))
+    if RULEBASE_PATH.exists():
+        content = RULEBASE_PATH.read_text()
+        logger.info("Rulebase loaded from %s (%d chars)", RULEBASE_PATH, len(content))
         return content
-    logger.warning("Rulebase not found at %s", rulebase_path)
-    return ""  # Fallback: empty rules (agent will have minimal guidance)
+    logger.warning("Rulebase not found at %s", RULEBASE_PATH)
+    return ""
 
+def _parse_max_iterations(rulebase_text: str, default: int = 6) -> int:
+    m = re.search(r'Max iterations:\s*(\d+)', rulebase_text)
+    return int(m.group(1)) if m else default
 
 RULEBASE = load_rulebase()
-
+AGENT_MAX_ITERATIONS = _parse_max_iterations(RULEBASE)
 
 def _extract_digit_starting_columns(data_profile: Optional[Dict[str, Any]]) -> List[str]:
     """Extract column names that start with digits from the data profile."""
     digit_cols = []
     if not data_profile:
         return digit_cols
-    
+
     for table_name, profile in data_profile.items():
         if isinstance(profile, dict) and 'columns' in profile:
             for col in profile['columns']:
@@ -75,452 +77,393 @@ def _extract_digit_starting_columns(data_profile: Optional[Dict[str, Any]]) -> L
     return digit_cols
 
 
-def _quote_sql_identifier(name: str) -> str:
-    """Wrap a column name in double quotes for SQL."""
-    return f'"{name}"'
-
-
-def supervisor_node(state: AgentState, model_client: ModelClient) -> AgentState:
+def thinker_node(state: AgentState, model_client: ModelClient) -> AgentState:
     """
-    Supervisor node: The ONLY routing decision maker.
-    
-    Sees full state and decides which specialist to invoke next.
-    Does NOT write SQL, code, or verification logic.
-    
-    Returns: {'current_action': <next>, 'conversation_history': [...]}
-    
-    If model returns unknown action (e.g., "explore"), defaults to "report" to terminate.
+    FIX #2: Guardrail ordering fixed. Max iterations check happens LAST and overrides all.
     """
-    logger.debug("Running supervisor_node, iteration=%d", state.get('iteration_count', 0))
+    iteration = state.get('iteration_count', 0)
     
+    # Build context
+    context_parts = [
+        f"Query: {state['query']}",
+        f"Available Tables: {state.get('table_names', [])}",
+    ]
+    
+    if state.get('execution_result'):
+        err = state['execution_result'].get('error')
+        if err:
+            context_parts.append(f"Last Error: {str(err)[:200]}")
+        res = state['execution_result'].get('result_repr')
+        if res:
+            context_parts.append(f"Last Result: {res[:200]}")
+            
+    if state.get('generated_code'):
+        code = state['generated_code']
+        if isinstance(code, dict):
+            if code.get('sql'): context_parts.append(f"Last SQL: {code['sql'][:100]}")
+            if code.get('python'): context_parts.append(f"Last Python: {code['python'][:100]}")
+
+    context = "\n".join(context_parts)
+    
+    logger.info("=== THINKER INPUT ===\n%s", context)
+
+    # Call LLM
     try:
-        # Build context from state
-        context_parts = []
-        
-        # User query
-        context_parts.append(f"User Query: {state.get('query', 'Unknown')}")
-        
-        # Schema summary
-        if state.get('schema_summary'):
-            context_parts.append(f"\nDataset Schema:\n{state['schema_summary']}")
-        elif state.get('table_names'):
-            context_parts.append(f"\nAvailable Tables: {', '.join(state['table_names'])}")
-        
-        # Current findings
-        if state.get('findings'):
-            context_parts.append(f"\nCurrent Findings:\n{state['findings']}")
-        
-        # Last execution error (if any)
-        if state.get('errors') and state['errors'][-1]:
-            context_parts.append(f"\nLast Error: {state['errors'][-1]}")
-        
-        # Completed steps
-        completed_steps = []
-        if state.get('data_profile'):
-            completed_steps.append("Data loaded and profiled")
-        if state.get('generated_code'):
-            completed_steps.append("Code generated and executed")
-        if state.get('artifacts'):
-            completed_steps.append(f"Artifacts generated: {len(state['artifacts'])} files")
-        
-        if completed_steps:
-            context_parts.append(f"\nCompleted Steps: {'; '.join(completed_steps)}")
-        
-        context = "\n".join(context_parts)
-        
-        # Call supervisor_step
-        decision = model_client.supervisor_step(
-            system_prompt=RULEBASE,
-            context=context,
-            user_query=state['query']
-        )
-        
-        # Log the raw model response for debugging
-        logger.info("Supervisor model response: %s", decision)
-        
-        next_action = decision.get('next', 'analyze')
-        reason = decision.get('reason', 'No reason provided')
-        
-        # Validate action: only allow known actions
-        valid_actions = {'fetch_data', 'analyze', 'visualize', 'report', 'done'}
-        if next_action not in valid_actions:
-            logger.warning("Supervisor returned invalid action '%s', defaulting to 'report'", next_action)
-            next_action = 'report'
-            reason = f"Invalid action '{next_action}' was returned by model, forcing report to terminate"
-            # Add error to state so we know this happened
-            state.setdefault('errors', []).append(f"Supervisor hallucinated action: {next_action}")
-        
-        # Hard guardrails
-        # If data_profile exists, force next != fetch_data
-        if state.get('data_profile') and next_action == 'fetch_data':
-            logger.warning("Supervisor tried to fetch_data but data already loaded, forcing analyze")
-            next_action = 'analyze'
-        
-        # If max iterations reached, force done
-        if state.get('iteration_count', 0) >= AGENT_MAX_ITERATIONS:
-            logger.warning("Max iterations reached, forcing done")
-            next_action = 'done'
-        
-        logger.info("Supervisor decided: next=%s, reason=%s", next_action, reason[:100] if reason else '')
-        
-        return {
-            'current_action': next_action,
-            'conversation_history': state.get('conversation_history', []) + [{
-                'role': 'assistant',
-                'content': f"Supervisor: Next action is '{next_action}' because {reason}"
-            }],
-            'iteration_count': state.get('iteration_count', 0) + 1
-        }
-        
+        decision = model_client.thinker_decide(RULEBASE, context)
+        logger.info("=== THINKER RAW OUTPUT ===\n%s", decision)
     except Exception as e:
-        logger.error("supervisor_node failed: %s", e)
-        return {
-            'errors': state.get('errors', []) + [f'Supervisor error: {e}'],
-            'current_action': 'report'
-        }
+        logger.error("Thinker LLM call failed: %s", e)
+        decision = {'action': 'report', 'reason': 'LLM error'}
 
+    action = decision.get('action', 'report')
+    reason = decision.get('reason', '')
+    
+    # Guardrail 1: Validate action
+    VALID = {'extract', 'analyze', 'visualize', 'report', 'done'}
+    if action not in VALID:
+        logger.warning("Invalid action '%s' from LLM, defaulting to report", action)
+        action = 'report'
+    
+    # Guardrail 2: Handle failure retry (ONLY if not at max iterations)
+    if not state.get('success') and action not in {'extract', 'analyze', 'report', 'done'}:
+        action = 'analyze'
+    
+    # Guardrail 3: MAX ITERATIONS CHECK (HAPPENS LAST - OVERRIDES ALL)
+    if iteration >= AGENT_MAX_ITERATIONS:
+        logger.warning("Max iterations (%d) reached. Forcing 'report' to terminate.", AGENT_MAX_ITERATIONS)
+        action = 'report'  # Explicitly route to report to explain failure
+        reason = "Max iterations reached"
 
-def data_fetch_node(state: AgentState, data_layer: DataLayer) -> AgentState:
-    """
-    Data fetch node: Load dataset schema and profile tables.
-    
-    Pure Python, no LLM call.
-    Guardrail: Skip if data_profile already exists.
-    
-    Returns: {'data_profile', 'table_names', 'schema_summary'}
-    """
-    logger.info("Running data_fetch_node")
-    
-    # Guardrail: skip if already fetched
-    if state.get('data_profile') is not None:
-        logger.debug("Data already fetched, skipping")
-        return {}
-    
-    try:
-        table_names = data_layer.get_table_names()
-    except Exception as e:
-        logger.error("Failed to get table names: %s", e)
-        return {
-            'errors': state.get('errors', []) + [f'Failed to list tables: {e}'],
-            'table_names': []
-        }
-    
-    if not table_names:
-        logger.warning("No tables found in dataset")
-        return {
-            'errors': state.get('errors', []) + ['No tables found in dataset'],
-            'table_names': []
-        }
-    
-    logger.info("Found %d tables: %s", len(table_names), table_names)
-    
-    # Profile each table
-    profiles = {}
-    for table_name in table_names:
-        try:
-            profiles[table_name] = data_layer.get_profile(table_name)
-            logger.debug("Profiled table %s", table_name)
-        except Exception as e:
-            logger.error("Failed to profile table %s: %s", table_name, e)
-            profiles[table_name] = {'error': str(e)}
-    
-    # Build compact schema summary for LLM context
-    summary_parts = []
-    for table_name, profile in profiles.items():
-        if 'error' in profile:
-            continue
-        summary_parts.append(f"Table: {table_name}")
-        summary_parts.append(f"  Rows: {profile['row_count']}")
-        summary_parts.append("  Columns:")
-        for col in profile['columns'][:10]:  # Limit columns shown
-            summary_parts.append(
-                f"    - {col['name']} ({col['type']}): "
-                f"{col['distinct_count']} distinct, "
-                f"{col['null_count']} nulls"
-            )
-            if col.get('sample_values'):
-                summary_parts.append(f"      Samples: {', '.join(col['sample_values'][:5])}")
-    
-    schema_summary = "\n".join(summary_parts)
-    logger.info("Data fetch complete, schema summary: %d chars", len(schema_summary))
+    # Construct feedback in Python (NOT LLM)
+    feedback = None
+    if action in ('extract', 'analyze') and iteration < AGENT_MAX_ITERATIONS:
+        last_error = (state.get('execution_result') or {}).get('error', '')
+        
+        if action == 'extract':
+            if last_error and 'does not exist' in str(last_error):
+                real_tables = state.get('table_names', [])
+                feedback = f"Use ONLY these tables: {real_tables}. Do not invent names."
+            else:
+                feedback = "Extract data using SQL. Filter rows, select columns. No aggregation."
+        
+        elif action == 'analyze':
+            if last_error:
+                feedback = f"Code failed: {str(last_error)[:150]}. Fix the error."
+            else:
+                feedback = "Analyze the DataFrame using pandas."
+
+    logger.info("Thinker Decision: action=%s, reason=%s", action, reason)
     
     return {
-        'data_profile': profiles,
-        'table_names': table_names,
-        'schema_summary': schema_summary,
-        'conversation_history': state.get('conversation_history', []) + [{
-            'role': 'system',
-            'content': f"Dataset loaded:\n{schema_summary}"
-        }]
+        'current_action': action,
+        'thinker_reason': reason,
+        'analyst_feedback': feedback,
+        'iteration_count': iteration + 1
     }
 
 
 def analyst_node(state: AgentState, model_client: ModelClient, sandbox: SandboxClient, data_layer: DataLayer) -> AgentState:
     """
-    Analyst node: Generate SQL/Python based on query and schema.
-    
-    Handles its own error reporting.
-    Post-processes generated code to quote digit-starting column names.
-    
-    Returns: {'generated_code', 'code_language', 'execution_result', 'findings', 'conversation_history'}
+    FIX #1: TRUE Two-Phase Execution.
+    1. Call analyst_generate() to get {sql, python}.
+    2. Execute SQL via DataLayer to get pandas DataFrame 'df'.
+    3. Inject 'df' into sandbox and execute Python code.
     """
-    logger.info("Running analyst_node")
+    iteration = state.get('iteration_count', 0)
+    logger.info("=== ANALYST NODE START (Iteration %d) ===", iteration)
     
-    task_description = f"Answer the query: {state['query']}"
-    if state.get('findings'):
-        task_description += f"\nPrevious findings: {state['findings']}"
+    # Build Table Manifest (Prevent Hallucination)
+    table_names = state.get('table_names', [])
+    table_manifest = "REGISTERED TABLES (YOU MUST USE ONLY THESE):\n"
+    for t in table_names:
+        table_manifest += f"- user_data.{t}\n"
+    table_manifest += "\nRULE: Do NOT invent table names like 'sales', 'states_2024', etc.\n"
     
-    # Build data context with explicit rules for digit-starting columns
-    data_context_parts = []
-    data_context_parts.append(f"Available tables: {', '.join(state.get('table_names', []))}")
-    
-    # Extract digit-starting columns and add explicit rule
+    # Get Digit Columns
     digit_cols = _extract_digit_starting_columns(state.get('data_profile'))
+    quoting_rule = ""
     if digit_cols:
-        data_context_parts.append(f"\nIMPORTANT: Column names starting with digits MUST be enclosed in double quotes in SQL.")
-        data_context_parts.append(f"Digit-starting columns found: {', '.join(digit_cols)}")
-        data_context_parts.append(f"Example: SELECT \"{digit_cols[0]}\" FROM table_name")
-        data_context_parts.append(f"DO NOT use these columns inside CASE statements. Instead, filter or aggregate them directly.")
-        data_context_parts.append(f"For example, instead of: CASE WHEN \"2WT\" > 0 THEN 1 ELSE 0 END")
-        data_context_parts.append("Use direct aggregation: SUM(\"2WT\") or COUNT(*) WHERE \"2WT\" > 0")
-        data_context_parts.append("CRITICAL DUCKDB RULE: Never use digit-starting column names inside string literals. Use them as quoted identifiers only.")
+        quoted_list = ', '.join([f'"{c}"' for c in digit_cols])
+        quoting_rule = f"\nMUST QUOTE THESE COLUMNS IN SQL: {quoted_list}\n"
     
+    # Build Context
+    context_parts = [table_manifest, quoting_rule]
     if state.get('schema_summary'):
-        data_context_parts.append(f"\nSchema Info:\n{state['schema_summary']}")
+        context_parts.append(f"Schema:\n{state['schema_summary']}")
+    context_parts.append(f"Query: {state['query']}")
     
-    # Add sample data examples from data_profile to help analyst understand column contents
-    if state.get('data_profile'):
-        data_context_parts.append("\n\nSAMPLE DATA VALUES (to help you understand what each column contains):")
-        for table_name, profile in state['data_profile'].items():
-            if isinstance(profile, dict) and 'columns' in profile:
-                data_context_parts.append(f"\nTable '{table_name}':")
-                for col in profile['columns'][:15]:  # Show up to 15 columns
-                    if col.get('sample_values'):
-                        samples_str = ', '.join(str(s) for s in col['sample_values'][:5])
-                        data_context_parts.append(f"  - {col['name']} ({col['type']}): Examples = [{samples_str}]")
-                    else:
-                        data_context_parts.append(f"  - {col['name']} ({col['type']})")
+    if state.get('analyst_feedback'):
+        context_parts.append(f"Instruction: {state['analyst_feedback']}")
     
-    data_context_parts.append("\n\nCRITICAL CODE FORMATTING RULES:")
-    data_context_parts.append("1. DO NOT include SQL comments (--) in your code - they cause syntax errors when executed")
-    data_context_parts.append("2. Return ONLY the raw SQL query or Python code, NO explanatory text")
-    data_context_parts.append("3. Do NOT use markdown code fences (```) - return plain code only")
-    data_context_parts.append("4. For SQL: start directly with SELECT, WITH, or other SQL keywords")
-    data_context_parts.append("5. NEVER use escaped quotes like \\\" inside SQL strings - use single quotes for strings")
-    data_context_parts.append("6. When generating JSON output, escape newlines in string values as \\n (not literal newlines)")
-    data_context_parts.append("7. For DuckDB SQL: Use double quotes for identifiers (\"2WT\"), single quotes for string literals ('Two Wheeler')")
-    
-    data_context = "\n".join(data_context_parts)
-    
-    # Generate code
-    code_result = model_client.generate_code(
-        system_prompt=RULEBASE,
-        task_description=task_description,
-        data_context=data_context
-    )
-    
-    # Log the raw model response for debugging
-    logger.info("Model raw response: %s", code_result.get('raw', str(code_result)[:500]))
-    
-    # Handle error response from generate_structured
-    if 'error' in code_result:
-        logger.warning("Code generation returned error: %s", code_result.get('error'))
-        # Try regex fallback to extract code from raw response
-        raw = code_result.get('raw', '')
-        code = ''
-        language = 'python'
-        
-        if raw:
-            # First try extracting from markdown code block (most reliable for multi-line SQL)
-            code_match = re.search(r'```(?:sql|python)?\s*([\s\S]*?)```', raw, re.IGNORECASE)
-            if code_match:
-                code = code_match.group(1).strip()
-                language = 'sql' if 'SELECT' in code.upper() or 'FROM' in code.upper() else 'python'
-                logger.info("Regex fallback extracted code from markdown block (%d chars)", len(code))
-            
-            # If no markdown block, try field extraction
-            if not code:
-                extracted = _extract_json_fields_regex(raw, ['code', 'language'])
-                if extracted and extracted.get('code'):
-                    code = extracted['code']
-                    language = extracted.get('language', 'python')
-                    logger.info("Regex fallback extracted code from JSON fields (%d chars)", len(code))
-            
-            # Last resort: look for SQL keywords and extract everything that looks like SQL
-            if not code:
-                sql_match = re.search(r'(SELECT[\s\S]*?FROM[\s\S]*?(?:WHERE[\s\S]*?)?)(?:$|\"|\})', raw, re.IGNORECASE)
-                if sql_match:
-                    code = sql_match.group(1).strip()
-                    language = 'sql'
-                    logger.info("Regex fallback extracted SQL query (%d chars)", len(code))
-    else:
-        code = code_result.get('code', '')
-        language = code_result.get('language', 'python')
-    
-    if not code:
-        logger.warning("Code generation returned empty code")
+    context = "\n".join(context_parts)
+    logger.info("=== ANALYST PROMPT CONTEXT ===\n%s", context[:1000])
+
+    # CALL ANALYST GENERATE (Two-Phase Schema)
+    try:
+        result = model_client.analyst_generate(RULEBASE, context)
+        logger.info("=== ANALYST RAW OUTPUT ===\n%s", result)
+    except Exception as e:
+        logger.error("Analyst LLM call failed: %s", e)
         return {
-            'errors': state.get('errors', []) + ['Failed to generate code'],
-            'generated_code': None,
-            'findings': 'Code generation failed: ' + code_result.get('error', 'Unknown error'),
-            'conversation_history': state.get('conversation_history', []) + [{
-                'role': 'assistant',
-                'content': 'Analyst: Code generation failed.'
-            }]
+            'errors': state.get('errors', []) + [f'LLM error: {e}'],
+            'findings': 'Code generation failed.',
+            'success': False,
+            'iteration_count': iteration + 1
+        }
+
+    sql = result.get('sql', '')
+    python_code = result.get('python', '')
+    
+    # Fallback parsing if needed
+    if not sql and not python_code:
+        fallback = _extract_json_fields_regex(str(result), ['sql', 'python'])
+        if fallback:
+            sql = fallback.get('sql', '')
+            python_code = fallback.get('python', '')
+
+    sql = _fix_table_references(sql, table_names)
+    sql = re.sub(r'`([^`]+)`', r'"\1"', sql)  # backtick backstop, still worth keeping
+    for col in digit_cols:
+        sql = re.sub(rf'(?<!")\b{re.escape(col)}\b(?!")', f'"{col}"', sql)
+    
+    logger.info("Generated SQL: %s", sql[:200] if sql else "None")
+    logger.info("Generated Python: %s", python_code[:200] if python_code else "None")
+
+    # EXECUTE TWO-PHASE
+    execution_result = {}
+    findings = ""
+    success = False
+
+    if not sql.strip() and not python_code.strip():
+        return {
+            'generated_code': {'sql': '', 'python': ''},
+            'findings': 'Analyst produced no SQL or Python — generation failed.',
+            'errors': state.get('errors', []) + ['Empty analyst generation'],
+            'success': False,
+            'iteration_count': iteration + 1
         }
     
-    # Post-process: wrap bare digit-starting column names in double quotes
-    # This regex finds digit-starting identifiers that are NOT already quoted
-    for col_name in digit_cols:
-        # Match the column name when NOT preceded by a double quote
-        pattern = r'(?<!")\b' + re.escape(col_name) + r'\b(?!")'
-        code = re.sub(pattern, _quote_sql_identifier(col_name), code)
-    
-    # CRITICAL FIX: Unescape any escaped double quotes (\" -> ")
-    # The model often escapes quotes for JSON, but DuckDB needs actual double quotes
-    code = code.replace('\\"', '"')
-    
-    logger.info("Generated code (post-processed):\n%s", code[:500])
-    
-    # Execute in sandbox
-    execution_result = sandbox.execute(code, timeout=30)
-    
-    # Handle execution result
-    error = execution_result.get('error')
-    if error:
-        logger.warning("Code execution failed: %s", error)
-        findings = f"Execution failed: {error}"
-        # Log the full execution error for debugging
-        logger.info("Full execution error details: %s", execution_result)
-    else:
-        result_repr = execution_result.get('result_repr', '')
-        stdout = execution_result.get('stdout', '')
-        findings = result_repr or stdout or "Code executed successfully."
-        # Log the successful execution result for debugging
-        logger.info("Execution result: %s", findings[:500])
-    
-    # Collect artifacts
-    new_artifacts = execution_result.get('artifacts', [])
-    
+    try:
+        # PHASE 1: SQL Extraction via DataLayer
+        df = None
+        if sql.strip():
+            logger.info("Executing SQL Phase...")
+            df = data_layer.conn.execute(sql).fetchdf()
+            execution_result['df_shape'] = df.shape
+            logger.info("SQL Phase Complete. Rows: %d", len(df))
+        else:
+            # Empty DF if no SQL
+            import pandas as pd
+            df = pd.DataFrame()
+            logger.info("No SQL provided. Using empty DataFrame.")
+        
+        # PHASE 2: Python Analysis in Sandbox with 'df' injected
+        if python_code.strip():
+            logger.info("Executing Python Phase...")
+            # Serialize df to JSON for safe injection into sandbox
+            df_json = df.to_json(orient='split')
+            bootstrap_code = f"""
+                import pandas as pd
+                import json
+                df = pd.read_json('''{df_json}''', orient='split')
+                """
+            full_code = bootstrap_code + "\n" + python_code
+            execution_result = sandbox.execute(full_code, timeout=30)
+            
+            # Check for result variable
+            if execution_result.get('error'):
+                raise Exception(execution_result['error'])
+                
+            findings = execution_result.get('result_repr', 'Analysis complete.')
+            success = True
+        else:
+            # If only SQL, return DF info
+            findings = f"SQL Execution Successful. Shape: {df.shape}\nHead:\n{df.head().to_string()}"
+            execution_result['result_repr'] = findings
+            success = True
+        
+    except Exception as e:
+        logger.error("Execution failed: %s", e)
+        execution_result['error'] = str(e)
+        findings = f"Execution failed: {e}"
+        success = False
+        return {
+            'generated_code': {'sql': sql, 'python': python_code},
+            'execution_result': execution_result,
+            'findings': findings,
+            'errors': state.get('errors', []) + [str(e)],
+            'success': success,
+            'iteration_count': iteration + 1
+        }
+
     return {
-        'generated_code': code,
-        'code_language': language,
+        'generated_code': {'sql': sql, 'python': python_code},
+        'code_language': 'python',
         'execution_result': execution_result,
         'findings': findings,
-        'artifacts': state.get('artifacts', []) + new_artifacts,
+        'success': success,
+        'iteration_count': iteration + 1
+    }
+
+
+def data_fetch_node(state: AgentState, data_layer: DataLayer) -> AgentState:
+    """Data fetch node: Load dataset schema and profile tables."""
+    logger.info("Running data_fetch_node")
+
+    if state.get('data_profile') is not None:
+        logger.debug("Data already fetched, skipping")
+        return {}
+
+    try:
+        table_names = data_layer.get_table_names()
+    except Exception as e:
+        logger.error("Failed to get table names: %s", e)
+        return {'errors': state.get('errors', []) + [f'Failed to list tables: {e}'], 'table_names': []}
+
+    if not table_names:
+        logger.warning("No tables found in dataset")
+        return {'errors': state.get('errors', []) + ['No tables found in dataset'], 'table_names': []}
+
+    logger.info("Found %d tables: %s", len(table_names), table_names)
+
+    profiles = {}
+    for table_name in table_names:
+        try:
+            profiles[table_name] = data_layer.get_profile(table_name)
+        except Exception as e:
+            logger.error("Failed to profile table %s: %s", table_name, e)
+            profiles[table_name] = {'error': str(e)}
+
+    summary_parts = []
+    for table_name, profile in profiles.items():
+        if 'error' in profile:
+            continue
+        summary_parts.append(f"Table: user_data.{table_name}")
+        summary_parts.append(f"  Rows: {profile['row_count']}")
+        summary_parts.append("  Columns:")
+        for col in profile['columns'][:10]:
+            summary_parts.append(f"    - {col['name']} ({col['type']}): {col['distinct_count']} distinct")
+            if col.get('sample_values'):
+                summary_parts.append(f"      Samples: {', '.join(col['sample_values'][:5])}")
+
+    schema_summary = "\n".join(summary_parts)
+    logger.info("Data fetch complete, schema summary: %d chars", len(schema_summary))
+
+    return {
+        'data_profile': profiles,
+        'table_names': table_names,
+        'schema_summary': schema_summary,
         'conversation_history': state.get('conversation_history', []) + [{
-            'role': 'assistant',
-            'content': f"Analyst: Executed {language} code. Result: {findings[:200]}"
+            'role': 'system', 'content': f"Dataset loaded:\n{schema_summary}"
         }]
     }
 
 
 def viz_node(state: AgentState, model_client: ModelClient, sandbox: SandboxClient) -> AgentState:
-    """
-    Visualization node: Generate matplotlib charts from findings.
-    
-    Only runs when supervisor routes to 'visualize'.
-    
-    Returns: {'artifacts', 'execution_result', 'conversation_history'}
-    """
+    """Visualization node: Generate matplotlib charts from findings."""
     logger.info("Running viz_node")
-    
+
     findings = state.get('findings', 'No findings available.')
     query = state.get('query', 'Unknown query')
-    
+
     task_description = (
         f"You are a visualization expert. Write Python matplotlib code to chart these findings.\n\n"
-        f"Query: {query}\n"
-        f"Findings:\n{findings}\n\n"
+        f"Query: {query}\nFindings:\n{findings}\n\n"
         f"Create a clear, professional chart. Save it to /scratch/chart.png"
     )
-    
+
     data_context = "Use matplotlib for plotting. Save figures to /scratch/ directory."
-    
-    # Generate code
-    code_result = model_client.generate_code(
-        system_prompt=RULEBASE,
-        task_description=task_description,
-        data_context=data_context
-    )
-    
-    # Log the raw model response for debugging
+
+    code_result = model_client.generate_code(RULEBASE, task_description, data_context)
     logger.info("Viz model response: %s", code_result)
-    
+
     code = code_result.get('code', '')
     language = code_result.get('language', 'python')
-    
+
     if not code:
         logger.warning("Viz code generation returned empty code")
-        return {
-            'errors': state.get('errors', []) + ['Failed to generate visualization code'],
-            'generated_code': None
-        }
-    
+        return {'errors': state.get('errors', []) + ['Failed to generate visualization code'], 'generated_code': None}
+
     logger.info("Generated viz code:\n%s", code[:500])
-    
-    # Execute in sandbox
+
     execution_result = sandbox.execute(code, timeout=30)
-    
-    # Collect artifacts
     new_artifacts = execution_result.get('artifacts', [])
-    
-    # Log execution result for debugging
+
     if execution_result.get('error'):
         logger.warning("Viz execution failed: %s", execution_result.get('error'))
     else:
         logger.info("Viz execution succeeded, artifacts: %s", new_artifacts)
-    
+
     return {
         'generated_code': code,
         'code_language': language,
         'execution_result': execution_result,
         'artifacts': state.get('artifacts', []) + new_artifacts,
         'conversation_history': state.get('conversation_history', []) + [{
-            'role': 'assistant',
-            'content': f"Visualization: Generated chart. Artifacts: {new_artifacts}"
+            'role': 'assistant', 'content': f"Visualization: Generated chart. Artifacts: {new_artifacts}"
         }]
     }
 
 
 def report_node(state: AgentState, model_client: ModelClient) -> AgentState:
     """
-    Reporting node: Generate final natural language response.
-    
-    Returns: {'final_response', 'interpretation', 'current_action': 'done'}
+    FIX #3: Reporting node strictly summarizes findings.
+    NO hallucinated follow-up questions or next steps.
     """
     logger.info("Running report_node")
-    
-    findings = state.get('findings', 'Analysis completed.')
+
+    findings = state.get('findings', 'No findings available.')
     errors = state.get('errors', [])
+    query = state.get('query', 'Unknown query')
     
-    # Build interpretation
+    # Build honest interpretation
     table_names = state.get('table_names', ['the dataset'])
-    interpretation = f"Based on the analysis of {', '.join(table_names)}, "
     
     if errors:
-        interpretation += f"some issues occurred: {', '.join(errors[-2:])}. "
-    
-    interpretation += f"The key finding is: {findings[:500]}..."
-    
-    # Generate response
-    response = model_client.generate_response(
-        system_prompt=RULEBASE,
-        query=state['query'],
-        findings=findings,
-        interpretation=interpretation
-    )
-    
-    # Log the generated response for debugging
-    logger.info("Report generated: %s", response[:500])
-    
+        interpretation = f"Analysis of {', '.join(table_names)} encountered issues: {', '.join(errors[-2:])}. Findings: {findings[:200]}"
+    else:
+        interpretation = f"Based on analysis of {', '.join(table_names)}: {findings[:500]}"
+
+    logger.info("Report Interpretation Context: %s", interpretation)
+
+    # Generate response (No follow-up questions instruction)
+    try:
+        response = model_client.generate_response(
+            system_prompt=RULEBASE,
+            query=query,
+            findings=findings,
+            interpretation=interpretation
+        )
+        logger.info("=== REPORT GENERATED ===\n%s", response)
+    except Exception as e:
+        logger.error("Report generation failed: %s", e)
+        response = f"Unable to generate final report due to error: {e}. Raw findings: {findings}"
+
     return {
         'findings': findings,
         'interpretation': interpretation,
         'final_response': response,
         'current_action': 'done',
         'conversation_history': state.get('conversation_history', []) + [{
-            'role': 'assistant',
-            'content': f"Report: {response[:500]}"
+            'role': 'assistant', 'content': f"Report: {response[:500]}"
         }]
     }
+
+def _fix_table_references(sql: str, table_names: List[str]) -> str:
+    """Rewrite hallucinated/malformed table names to the real registered table.
+    Small local models frequently ignore explicit naming instructions —
+    correct deterministically rather than re-prompting."""
+    if not table_names:
+        return sql
+
+    norm_lookup = {t.lower().replace('_', ''): t for t in table_names}
+
+    def replace_ref(m):
+        keyword, raw_name = m.group(1), m.group(2)
+        clean = raw_name.split('.')[-1].strip('"\'`')
+        key = clean.lower().replace('_', '')
+        if key in norm_lookup:
+            return f'{keyword} user_data.{norm_lookup[key]}'
+        return m.group(0)
+
+    return re.sub(r'\b(FROM|JOIN)\s+([a-zA-Z_][a-zA-Z0-9_.]*)', replace_ref, sql, flags=re.IGNORECASE)

@@ -135,6 +135,10 @@ class SandboxClient:
         if timeout < 1:
             timeout = 1
 
+        # Log the request (code) for debugging
+        logger.info("Executing code (first 300 chars): %s", code[:300])
+        logger.debug("Full code being executed:\n%s", code)
+
         request = {
             'code': code,
             'timeout': timeout
@@ -202,7 +206,16 @@ class SandboxClient:
                     'artifacts': []
                 }
 
-            logger.debug("Execution completed, error=%s", response.get('error'))
+            # Log the response summary
+            if response.get('error'):
+                logger.warning("Execution failed: %s", response['error'])
+                logger.debug("Full error response: %s", response)
+            else:
+                logger.info("Execution succeeded. stdout length=%d, result_repr=%s",
+                           len(response.get('stdout', '')),
+                           response.get('result_repr', '')[:100])
+                logger.debug("Full execution response: %s", response)
+
             return response
 
     def get_artifact(self, artifact_path: str) -> Optional[bytes]:
@@ -219,6 +232,8 @@ class SandboxClient:
             logger.warning("Cannot get artifact: container not running")
             return None
 
+        logger.info("Retrieving artifact: %s", artifact_path)
+
         # Extract file from container
         cmd = [
             'docker', 'cp',
@@ -229,6 +244,7 @@ class SandboxClient:
         try:
             logger.debug("Copying artifact %s", artifact_path)
             result = subprocess.run(cmd, capture_output=True, check=True)
+            logger.info("Artifact retrieved successfully, size=%d bytes", len(result.stdout))
             return result.stdout
         except subprocess.CalledProcessError as e:
             logger.error("Failed to copy artifact %s: %s", artifact_path, e)
@@ -251,7 +267,9 @@ class SandboxClient:
 
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            return [line.strip() for line in result.stdout.split('\n') if line.strip()]
+            artifacts = [line.strip() for line in result.stdout.split('\n') if line.strip()]
+            logger.info("Found %d artifacts: %s", len(artifacts), artifacts)
+            return artifacts
         except subprocess.CalledProcessError as e:
             logger.error("Failed to list artifacts: %s", e)
             return []

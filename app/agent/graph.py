@@ -13,7 +13,7 @@ from langgraph.graph import StateGraph, END
 
 from app.agent.nodes import (
     AgentState,
-    supervisor_node,
+    thinker_node,
     data_fetch_node,
     analyst_node,
     viz_node,
@@ -22,6 +22,8 @@ from app.agent.nodes import (
 from app.agent.model_client import ModelClient
 from app.agent.sandbox_client import SandboxClient
 from app.agent.data_layer import DataLayer
+from app.config import AGENT_MAX_ITERATIONS
+
 
 logger = logging.getLogger(__name__)
 
@@ -81,12 +83,18 @@ class AgentGraph:
         logger.info("Building LangGraph state machine")
 
         # Define node functions with bound dependencies
-        def supervisor(state: AgentState) -> AgentState:
+        def thinker(state: AgentState) -> AgentState:
             try:
-                return supervisor_node(state, self.model_client)
+                result = thinker_node(state, self.model_client)
+                # Log model output from thinker
+                logger.info("Thinker model output: action=%s", result.get('current_action'))
+                if 'conversation_history' in result and result['conversation_history']:
+                    last_msg = result['conversation_history'][-1]
+                    logger.debug("Thinker reasoning: %s", last_msg.get('content', '')[:200])
+                return result
             except Exception as e:
-                logger.error("supervisor_node failed: %s", e)
-                return {'errors': state.get('errors', []) + [f'Supervisor error: {e}'], 'current_action': 'report'}
+                logger.error("thinker_node failed: %s", e)
+                return {'errors': state.get('errors', []) + [f'Thinker error: {e}'], 'current_action': 'report'}
 
         def fetch_data(state: AgentState) -> AgentState:
             try:
@@ -97,71 +105,91 @@ class AgentGraph:
 
         def analyze(state: AgentState) -> AgentState:
             try:
-                return analyst_node(state, self.model_client, self.sandbox, self.data_layer)
+                result = analyst_node(state, self.model_client, self.sandbox, self.data_layer)
+                logger.info("Analyst model output: findings=%s", result.get('findings'))
+                gc = result.get('generated_code')
+                if isinstance(gc, dict):
+                    logger.debug("Analyst SQL: %s", gc.get('sql', '')[:200])
+                    logger.debug("Analyst Python: %s", gc.get('python', '')[:200])
+                elif gc:
+                    logger.debug("Analyst generated code: %s", gc[:300])
+                return result
             except Exception as e:
                 logger.error("analyst_node failed: %s", e)
-                return {'errors': state.get('errors', []) + [f'Analyst error: {e}'], 'generated_code': None, 'findings': 'Analysis failed.'}
+                return {
+                    'errors': state.get('errors', []) + [f'Analyst error: {e}'],
+                    'generated_code': None,
+                    'findings': 'Analysis failed.',
+                    'success': False,   # was missing — stale success flag from prior iteration otherwise persists
+                }
 
         def visualize(state: AgentState) -> AgentState:
             try:
-                return viz_node(state, self.model_client, self.sandbox)
+                result = viz_node(state, self.model_client, self.sandbox)
+                # Log model output from visualization (code generation)
+                if result.get('generated_code'):
+                    logger.info("Visualize model output: generated_code (first 300 chars) = %s", result['generated_code'][:300])
+                else:
+                    logger.info("Visualize model output: no code generated")
+                return result
             except Exception as e:
                 logger.error("viz_node failed: %s", e)
                 return {'errors': state.get('errors', []) + [f'Visualization error: {e}']}
 
         def report(state: AgentState) -> AgentState:
             try:
-                return report_node(state, self.model_client)
+                result = report_node(state, self.model_client)
+                # Log final model response
+                logger.info("Report model output: final_response=%s", result.get('final_response'))
+                if result.get('interpretation'):
+                    logger.info("Report model output: interpretation=%s", result.get('interpretation'))
+                return result
             except Exception as e:
                 logger.error("report_node failed: %s", e)
                 return {'final_response': f"Error generating response: {e}", 'findings': state.get('findings', 'Unknown'), 'interpretation': 'Error occurred during analysis', 'current_action': 'done'}
 
         # Create the graph
         workflow = StateGraph(AgentState)
-
-        # Add nodes
-        workflow.add_node("supervisor", supervisor)
+        workflow.add_node("thinker", thinker)
         workflow.add_node("fetch_data", fetch_data)
         workflow.add_node("analyst", analyze)
         workflow.add_node("visualize", visualize)
         workflow.add_node("report", report)
 
-        # Set entry point
-        workflow.set_entry_point("supervisor")
+        workflow.set_entry_point("thinker")
 
-        # Define conditional edges from supervisor
-        def route_from_supervisor(state: AgentState) -> Literal["fetch_data", "analyst", "visualize", "report", "__end__"]:
+        # FIX C: Route function checks iteration count
+        def route_from_thinker(state: AgentState) -> Literal["fetch_data", "analyst", "visualize", "report", "__end__"]:
             action = state.get('current_action', 'analyze')
-            logger.debug("route_from_supervisor: action=%s", action)
+            iteration = state.get('iteration_count', 0)
+            
+            # Hard stop if max iterations hit
+            if iteration >= AGENT_MAX_ITERATIONS:
+                logger.warning("Max iterations hit in routing, forcing END")
+                return 'report'  # Route to report to explain failure
+            
+            logger.debug("Routing action: %s", action)
             
             if action == 'fetch_data':
                 return 'fetch_data'
-            elif action == 'analyze':
+            elif action in ('extract', 'analyze'):
                 return 'analyst'
             elif action == 'visualize':
                 return 'visualize'
-            elif action == 'report' or action == 'done':
+            elif action in ('report', 'done'):
                 return 'report'
             else:
-                # Default to analyst for unknown actions
-                logger.warning("Unknown action '%s', defaulting to analyst", action)
                 return 'analyst'
 
-        workflow.add_conditional_edges(
-            source="supervisor",
-            path=route_from_supervisor,
-        )
+        workflow.add_conditional_edges(source="thinker", path=route_from_thinker)
 
-        # Workers always return to supervisor (except report which ends)
-        workflow.add_edge("fetch_data", "supervisor")
-        workflow.add_edge("analyst", "supervisor")
-        workflow.add_edge("visualize", "supervisor")
-        
-        # Report ends the loop
+        workflow.add_edge("fetch_data", "thinker")
+        workflow.add_edge("analyst", "thinker")
+        workflow.add_edge("visualize", "thinker")
         workflow.add_edge("report", END)
 
-        logger.info("LangGraph state machine built successfully")
         return workflow.compile()
+
 
     def run(self, query: str) -> dict:
         """

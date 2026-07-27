@@ -12,4 +12,9 @@ __pycache__/
 .env
 .env.local
 .env.*
-```
+
+models/
+logs/
+
+venv/
+ai_analyzer.egg-info/

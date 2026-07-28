@@ -156,7 +156,14 @@ class AgentGraph:
         workflow.add_node("visualize", visualize)
         workflow.add_node("report", report)
 
-        workflow.set_entry_point("thinker")
+        # Entry point is fetch_data, not thinker. The thinker's action space
+        # is grammar-constrained to extract|analyze|visualize|report|done —
+        # it can never emit 'fetch_data' itself, so if the graph enters at
+        # "thinker" the fetch_data node is unreachable and schema/profile
+        # data never loads. The fetch_data -> thinker edge below carries it
+        # forward from there; fetch_data itself no-ops on later passes
+        # since data_fetch_node skips work once data_profile is populated.
+        workflow.set_entry_point("fetch_data")
 
         # FIX C: Route function checks iteration count
         def route_from_thinker(state: AgentState) -> Literal["fetch_data", "analyst", "visualize", "report", "__end__"]:

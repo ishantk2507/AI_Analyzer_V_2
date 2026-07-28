@@ -215,7 +215,7 @@ class SandboxClient:
                            len(response.get('stdout', '')),
                            response.get('result_repr', '')[:100])
                 logger.debug("Full execution response: %s", response)
-
+            print(f"Execution response: {response}")
             return response
 
     def get_artifact(self, artifact_path: str) -> Optional[bytes]:

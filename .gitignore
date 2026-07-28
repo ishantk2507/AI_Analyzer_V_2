@@ -1,1 +1,22 @@
-Nothing should be ignored in this case, as the changes only include source files (.py) and a markdown file, with no build artifacts, dependencies, or temporary files present.
+```
+# Python
+app/__pycache__/
+app/*.pyc
+app/*.pyo
+app/*.pyd
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+.env.*
+
+models/
+logs/
+
+venv/
+ai_analyzer.egg-info/
+app/__pycache__/__init__.cpython-312.pyc
+app/__pycache__/config.cpython-312.pyc

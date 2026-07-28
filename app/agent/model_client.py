@@ -114,6 +114,15 @@ def _sanitize_json_string(raw: str) -> str:
     escape = False
     i = 0
 
+    # JSON only permits a backslash before these characters. Small local
+    # models frequently emit backslash-apostrophe (\') or backslash-backtick
+    # (\`) when generating embedded code (Python uses \' in some contexts;
+    # backticks show up in ad-hoc markdown-style quoting). Those are not
+    # legal JSON escapes and make json.loads() fail with "Invalid \escape".
+    # The model didn't mean an escape sequence there — it meant the literal
+    # character — so drop the stray backslash and keep the character.
+    VALID_ESCAPE_CHARS = set('"\\/bfnrtu')
+
     while i < len(blob):
         ch = blob[i]
 
@@ -124,8 +133,12 @@ def _sanitize_json_string(raw: str) -> str:
             continue
 
         if ch == '\\':
-            result.append(ch)
-            escape = True
+            nxt = blob[i + 1] if i + 1 < len(blob) else ''
+            if nxt in VALID_ESCAPE_CHARS:
+                result.append(ch)
+                escape = True
+            # else: invalid escape — drop the backslash; the next loop
+            # iteration handles `nxt` as a normal (non-escaped) character.
             i += 1
             continue
 

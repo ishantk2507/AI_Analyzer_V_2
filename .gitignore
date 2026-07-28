@@ -1,0 +1,22 @@
+```
+# Python
+app/__pycache__/
+app/*.pyc
+app/*.pyo
+app/*.pyd
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+.env.*
+
+models/
+logs/
+
+venv/
+ai_analyzer.egg-info/
+app/__pycache__/__init__.cpython-312.pyc
+app/__pycache__/config.cpython-312.pyc

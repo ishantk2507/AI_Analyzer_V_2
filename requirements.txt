@@ -1,0 +1,19 @@
+# Core dependencies
+streamlit
+langgraph
+langchain-core
+
+# LLM inference (in-process, no daemon)
+
+# llama-cpp-python 
+
+# Data engine
+duckdb
+pandas
+pyarrow
+
+# Visualization (headless)
+matplotlib
+
+# Docker SDK for Python
+docker

@@ -1,0 +1,24 @@
+FROM python:3.11-slim
+
+ENV HF_HUB_OFFLINE=1
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV MPLBACKEND=Agg
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libopenblas-dev \
+    libblas-dev \
+    liblapack-dev \
+    gfortran \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir \
+    duckdb \
+    pandas \
+    matplotlib \
+    pyarrow
+
+RUN mkdir -p /data /scratch
+
+COPY docker/persistent_repl.py /persistent_repl.py
+
+CMD ["tail", "-f", "/dev/null"]

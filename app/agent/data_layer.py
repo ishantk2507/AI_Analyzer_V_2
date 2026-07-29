@@ -149,6 +149,26 @@ class DataLayer:
             for row in result
         ]
     
+    def get_full_table(self, table_name: str):
+        """
+        Load an entire registered table into a pandas DataFrame — every
+        column, every row, no filtering.
+
+        This is the only SQL DuckDB runs anywhere in the pipeline now (see
+        rulebase.md's ARCHITECTURE NOTE: there is no model-generated SQL
+        phase anymore). It's still a plain f-string SQL build, but the only
+        variable in it is `table_name`, which always comes from
+        get_table_names() — never from model output — so there's no
+        injection surface here despite the string formatting.
+
+        Callers needing to know which table to load should use a
+        deterministic selector (e.g. nodes.py's _select_table, matched by
+        column presence per rulebase.md's dataset_manifest) rather than
+        asking the model to name one.
+        """
+        quoted_table = _quote_identifier(table_name)
+        return self.conn.execute(f"SELECT * FROM user_data.{quoted_table}").fetchdf()
+
     def get_profile(self, table_name: str) -> Dict[str, Any]:
         """
         Get a statistical profile of a table.

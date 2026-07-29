@@ -1,24 +1,33 @@
-```
-# Python
-app/__pycache__/
-app/*.pyc
-app/*.pyo
-app/*.pyd
+```gitignore
+# Compiled and build artifacts
+*.pyc
+__pycache__/
 
-# Logs
+# Dependencies
+.venv/
+venv/
+node_modules/
+
+# Logs and temp files
 *.log
+*.tmp
+*.swp
 
 # Environment
 .env
 .env.local
 .env.*
 
-models/
-logs/
+# Editors
+.vscode/
+.idea/
 
-venv/
-ai_analyzer.egg-info/
-app/__pycache__/__init__.cpython-312.pyc
-app/__pycache__/config.cpython-312.pyc
+# Coverage reports
+.coverage
+coverage/
+htmlcov/
 
-app/agent/__pycache__/
+# Python cache
+.mypy_cache/
+.pytest_cache/
+```

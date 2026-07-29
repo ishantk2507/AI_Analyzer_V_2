@@ -363,6 +363,7 @@ def thinker_node(state: AgentState, model_client: ModelClient) -> AgentState:
                 "calling to_dict(), to_dict('records'), or similar on the "
                 "DataFrame."
             )
+            action = 'analyze'  # Force analyze since it's a Python/resource issue
         elif missing_cols_diagnosis:
             # Deterministic override: this specific failure has a known,
             # concrete fix (add the column to SELECT). Don't let the generic
@@ -372,6 +373,12 @@ def thinker_node(state: AgentState, model_client: ModelClient) -> AgentState:
             # force it to 'extract' since the fix is in the SQL.
             feedback = missing_cols_diagnosis
             action = 'extract'
+        elif _is_python_exception(err_str_top):
+            # ANY Python exception = analyze, regardless of what the LLM chose.
+            # This prevents the model from routing KeyError/TypeError/etc. to
+            # 'extract' and trying to "fix" a Python bug by changing SQL.
+            action = 'analyze'
+            feedback = f"Code failed: {str(last_error)[:200]}. Fix the Python code."
         elif action == 'extract':
             err_str = str(last_error) if last_error else ''
             zero_rows_hint = (state.get('execution_result') or {}).get('zero_rows_hint')
@@ -463,6 +470,17 @@ def thinker_node(state: AgentState, model_client: ModelClient) -> AgentState:
         'analyst_feedback': feedback,
         'iteration_count': iteration + 1
     }
+
+def _is_python_exception(err_str: str) -> bool:
+    """Check if the error string is a Python exception (KeyError, TypeError, etc.)."""
+    if not err_str:
+        return False
+    python_exceptions = [
+        'KeyError', 'TypeError', 'ValueError', 'AttributeError', 
+        'IndexError', 'SyntaxError', 'NameError', 'ZeroDivisionError'
+    ]
+    return any(exc in err_str for exc in python_exceptions)
+
 
 def _sanitize_python_code(code: str) -> str:
     """Strip markdown fences and import statements. No content-altering

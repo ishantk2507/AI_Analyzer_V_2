@@ -578,7 +578,7 @@ class ModelClient:
 
         result = self.generate_structured(
             messages=messages,
-            output_schema='{"sql": "single line SQL", "python": "pandas code", "language": "python"}',
+            output_schema='{"python": "pandas code", "language": "python"}',
             grammar=GRAMMAR_ANALYST,
             max_tokens=1024,   # was defaulting to 256
             temperature=0.2,

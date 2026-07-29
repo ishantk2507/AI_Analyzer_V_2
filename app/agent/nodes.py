@@ -41,7 +41,7 @@ class AgentState(TypedDict):
     schema_summary: Optional[str]
     conversation_history: List[Dict[str, str]]
     current_action: str
-    generated_code: Optional[Dict[str, str]]  # Changed to dict {sql, python}
+    generated_code: Optional[Dict[str, str]]  # {"python": "..."}
     code_language: Optional[str]
     execution_result: Optional[Dict[str, Any]]
     findings: Optional[str]
@@ -177,6 +177,51 @@ _CATEGORY_SUBTYPE_GROUPS: List[tuple] = [
     (r'\btwo[\s-]*wheel', ['2WT', '2WN', '2WIC'], 'Two Wheeler'),
     (r'\bthree[\s-]*wheel', ['3WT', '3WN'], 'Three Wheeler'),
 ]
+
+
+def _select_table(query: str, table_names: List[str], data_profile: Dict[str, Any]) -> str:
+    """
+    Deterministic table selector based on keyword→column mapping.
+    
+    Match a table by the column it contains, not by assumed name:
+    - has VEHICLE_CLASS → vehicle-class dataset
+    - has FUEL → fuel-wise dataset  
+    - has MAKER → manufacturer-wise dataset
+    - has NORMS → emission-norm-wise dataset
+    
+    If no keyword matches, default to first table (broadest/most general).
+    """
+    keyword_to_column = {
+        'vehicle': 'VEHICLE_CLASS',
+        'class': 'VEHICLE_CLASS',
+        'type': 'VEHICLE_CLASS',
+        'fuel': 'FUEL',
+        'maker': 'MAKER',
+        'manufacturer': 'MAKER',
+        'norm': 'NORMS',
+        'emission': 'NORMS',
+        'standard': 'NORMS',
+    }
+    
+    query_lower = query.lower()
+    
+    # Build column lookup: column_name (uppercase) → table_name
+    col_to_table = {}
+    for table_name in table_names:
+        profile = data_profile.get(table_name, {})
+        for col_info in profile.get('columns', []):
+            col_upper = col_info['name'].upper()
+            if col_upper not in col_to_table:
+                col_to_table[col_upper] = table_name
+    
+    # Match keywords to columns
+    for keyword, column in keyword_to_column.items():
+        if keyword in query_lower:
+            if column in col_to_table:
+                return col_to_table[column]
+    
+    # Default to first table if no match
+    return table_names[0] if table_names else ''
 
 
 def _category_group_hint(query: str, table_columns: Dict[str, List[str]]) -> str:

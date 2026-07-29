@@ -30,9 +30,7 @@ logger = logging.getLogger(__name__)
 # GBNF grammars for llama.cpp backend (Linux/Mac only)
 GRAMMAR_ANALYST = r'''
 root ::= output
-output ::= "{" ws "\"sql\"" ws ":" ws oneline_string ws "," ws "\"python\"" ws ":" ws string ws "," ws "\"language\"" ws ":" ws "\"python\"" ws "}"
-oneline_string ::= "\"" oneline_char* "\""
-oneline_char ::= [a-zA-Z0-9 .,;:='*()_<>!@#$%^&+/-] | "\\" (["\\/bfnrt] | "u" [0-9a-fA-F]{4})
+output ::= "{" ws "\"python\"" ws ":" ws string ws "," ws "\"language\"" ws ":" ws "\"python\"" ws "}"
 string ::= "\"" char* "\""
 char ::= [^"\\] | "\\" (["\\/bfnrt] | "u" [0-9a-fA-F]{4})
 ws ::= [ \t\n]*
@@ -566,7 +564,7 @@ class ModelClient:
     def analyst_generate(self, system_prompt: str, context: str) -> Dict[str, Any]:
         """
         Generate Analyst agent output.
-        FIX E: SQL is forced to single line by grammar.
+        Returns {"python": "...", "language": "python"} only — no SQL field.
         """
         if self.model is None:
             raise RuntimeError("Model not loaded")
@@ -580,10 +578,10 @@ class ModelClient:
             messages=messages,
             output_schema='{"python": "pandas code", "language": "python"}',
             grammar=GRAMMAR_ANALYST,
-            max_tokens=1024,   # was defaulting to 256
+            max_tokens=1024,
             temperature=0.2,
         )
-        logger.info("Analyst generated: sql=%s, python=%s", result.get('sql', '')[:100], result.get('python', '')[:100])
+        logger.info("Analyst generated python=%s", result.get('python', '')[:100])
         return result
 
     def generate_code(

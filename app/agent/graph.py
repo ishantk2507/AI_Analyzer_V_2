@@ -18,11 +18,11 @@ from app.agent.nodes import (
     analyst_node,
     viz_node,
     report_node,
+    get_agent_max_iterations,
 )
 from app.agent.model_client import ModelClient
 from app.agent.sandbox_client import SandboxClient
 from app.agent.data_layer import DataLayer
-from app.config import AGENT_MAX_ITERATIONS
 
 
 logger = logging.getLogger(__name__)
@@ -156,7 +156,14 @@ class AgentGraph:
         workflow.add_node("visualize", visualize)
         workflow.add_node("report", report)
 
-        workflow.set_entry_point("thinker")
+        # Entry point is fetch_data, not thinker. The thinker's action space
+        # is grammar-constrained to extract|analyze|visualize|report|done —
+        # it can never emit 'fetch_data' itself, so if the graph enters at
+        # "thinker" the fetch_data node is unreachable and schema/profile
+        # data never loads. The fetch_data -> thinker edge below carries it
+        # forward from there; fetch_data itself no-ops on later passes
+        # since data_fetch_node skips work once data_profile is populated.
+        workflow.set_entry_point("fetch_data")
 
         # FIX C: Route function checks iteration count
         def route_from_thinker(state: AgentState) -> Literal["fetch_data", "analyst", "visualize", "report", "__end__"]:
@@ -164,7 +171,8 @@ class AgentGraph:
             iteration = state.get('iteration_count', 0)
             
             # Hard stop if max iterations hit
-            if iteration >= AGENT_MAX_ITERATIONS:
+            max_iterations = get_agent_max_iterations()
+            if iteration >= max_iterations:
                 logger.warning("Max iterations hit in routing, forcing END")
                 return 'report'  # Route to report to explain failure
             

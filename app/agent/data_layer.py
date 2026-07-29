@@ -149,6 +149,26 @@ class DataLayer:
             for row in result
         ]
     
+    def get_full_table(self, table_name: str):
+        """
+        Load an entire registered table into a pandas DataFrame — every
+        column, every row, no filtering.
+
+        This is the only SQL DuckDB runs anywhere in the pipeline now (see
+        rulebase.md's ARCHITECTURE NOTE: there is no model-generated SQL
+        phase anymore). It's still a plain f-string SQL build, but the only
+        variable in it is `table_name`, which always comes from
+        get_table_names() — never from model output — so there's no
+        injection surface here despite the string formatting.
+
+        Callers needing to know which table to load should use a
+        deterministic selector (e.g. nodes.py's _select_table, matched by
+        column presence per rulebase.md's dataset_manifest) rather than
+        asking the model to name one.
+        """
+        quoted_table = _quote_identifier(table_name)
+        return self.conn.execute(f"SELECT * FROM user_data.{quoted_table}").fetchdf()
+
     def get_profile(self, table_name: str) -> Dict[str, Any]:
         """
         Get a statistical profile of a table.
@@ -157,23 +177,19 @@ class DataLayer:
         Designed to be compact for LLM context (aggregated stats only).
         """
         schema = self.get_schema(table_name)
-        profile = {
-            'table_name': table_name,
-            'row_count': 0,
-            'columns': []
-        }
-        
-        # Get row count
         quoted_table = _quote_identifier(table_name)
+        profile: Dict[str, Any] = {'table_name': table_name, 'row_count': 0, 'columns': []}
+
+        # Get row count
         row_result = self.conn.execute(f"SELECT COUNT(*) FROM user_data.{quoted_table}").fetchone()
         profile['row_count'] = row_result[0] if row_result else 0
-        
+
         # Get per-column stats
         for col_info in schema:
             col_name = col_info['column_name']
             col_type = col_info['data_type']
             quoted_col = _quote_identifier(col_name)
-            
+
             # Build dynamic query for stats
             stats_query = f"""
                 SELECT 
@@ -183,7 +199,7 @@ class DataLayer:
                 FROM user_data.{quoted_table}
             """
             stats_result = self.conn.execute(stats_query).fetchone()
-            
+
             col_profile = {
                 'name': col_name,
                 'type': col_type,
@@ -193,23 +209,25 @@ class DataLayer:
                 'distinct_count': stats_result[2] if stats_result[2] else 0,
                 'sample_values': []
             }
-            
-            # Get sample values for ALL columns (not just low-cardinality ones)
-            # This helps the analyst understand what each column contains
+
+            # Get sample values for ALL columns (not just low-cardinality ones).
+            # Show every distinct value when cardinality is low (helps the
+            # analyst match filter values exactly); otherwise just a handful.
+            sample_limit = 25 if col_profile['distinct_count'] and col_profile['distinct_count'] <= 25 else 5
             sample_query = f"""
                 SELECT DISTINCT {quoted_col} 
                 FROM user_data.{quoted_table} 
                 WHERE {quoted_col} IS NOT NULL
-                LIMIT 5
+                LIMIT {sample_limit}
             """
             try:
                 samples = self.conn.execute(sample_query).fetchall()
                 col_profile['sample_values'] = [str(s[0]) for s in samples]
             except Exception:
                 pass
-            
+
             profile['columns'].append(col_profile)
-        
+
         return profile
     
     def execute_query(self, sql: str, params: Optional[Dict] = None) -> List[Dict]:

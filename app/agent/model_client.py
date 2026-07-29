@@ -2,7 +2,9 @@
 LLM client using llama-cpp-python for in-process model inference.
 
 Architecture for 2-Agent Thinker-Analyst system:
-- Analyst: Two-phase generation (SQL extraction + Python analysis) using structured JSON
+- Analyst: Python-only generation using structured JSON. Table selection and
+  data loading are deterministic (no SQL phase, no model-generated SQL) —
+  see analyst_node in nodes.py.
 - Thinker: Validates results and routes to next action (extract|analyze|visualize|report|done)
 
 Platform handling:
@@ -28,11 +30,14 @@ logger = logging.getLogger(__name__)
 
 
 # GBNF grammars for llama.cpp backend (Linux/Mac only)
+#
+# Single-key schema: there is no SQL phase anymore (see rulebase.md's
+# ARCHITECTURE NOTE). Table selection and data loading both happen in
+# deterministic Python before the analyst is ever called (see analyst_node
+# in nodes.py) — the model only ever writes the pandas analysis code.
 GRAMMAR_ANALYST = r'''
 root ::= output
-output ::= "{" ws "\"sql\"" ws ":" ws oneline_string ws "," ws "\"python\"" ws ":" ws string ws "," ws "\"language\"" ws ":" ws "\"python\"" ws "}"
-oneline_string ::= "\"" oneline_char* "\""
-oneline_char ::= [a-zA-Z0-9 .,;:='*()_<>!@#$%^&+/-] | "\\" (["\\/bfnrt] | "u" [0-9a-fA-F]{4})
+output ::= "{" ws "\"python\"" ws ":" ws string ws "," ws "\"language\"" ws ":" ws "\"python\"" ws "}"
 string ::= "\"" char* "\""
 char ::= [^"\\] | "\\" (["\\/bfnrt] | "u" [0-9a-fA-F]{4})
 ws ::= [ \t\n]*
@@ -532,7 +537,7 @@ class ModelClient:
             except json.JSONDecodeError as e:
                 logger.error("Failed to parse JSON: %s, raw: %s", e, raw_response)
                 # Fallback: extract fields via regex
-                fallback_result = _extract_json_fields_regex(raw_response, ['code', 'language', 'next', 'reason', 'action', 'feedback', 'sql', 'python'])
+                fallback_result = _extract_json_fields_regex(raw_response, ['code', 'language', 'next', 'reason', 'action', 'feedback', 'python'])
                 if fallback_result:
                     logger.info("Regex fallback succeeded, extracted: %s", fallback_result)
                     return fallback_result
@@ -565,8 +570,10 @@ class ModelClient:
 
     def analyst_generate(self, system_prompt: str, context: str) -> Dict[str, Any]:
         """
-        Generate Analyst agent output.
-        FIX E: SQL is forced to single line by grammar.
+        Generate Analyst agent output — Python only. `context` (built by
+        analyst_node) already tells the model which table is loaded into
+        `df` and shows only that table's schema; there is no 'table' or
+        'sql' field for the model to fill in.
         """
         if self.model is None:
             raise RuntimeError("Model not loaded")
@@ -583,7 +590,7 @@ class ModelClient:
             max_tokens=1024,   # was defaulting to 256
             temperature=0.2,
         )
-        logger.info("Analyst generated: sql=%s, python=%s", result.get('sql', '')[:100], result.get('python', '')[:100])
+        logger.info("Analyst generated: python=%s", result.get('python', '')[:100])
         return result
 
     def generate_code(

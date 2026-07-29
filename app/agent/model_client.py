@@ -2,7 +2,9 @@
 LLM client using llama-cpp-python for in-process model inference.
 
 Architecture for 2-Agent Thinker-Analyst system:
-- Analyst: Two-phase generation (SQL extraction + Python analysis) using structured JSON
+- Analyst: Python-only generation using structured JSON. Table selection and
+  data loading are deterministic (no SQL phase, no model-generated SQL) —
+  see analyst_node in nodes.py.
 - Thinker: Validates results and routes to next action (extract|analyze|visualize|report|done)
 
 Platform handling:
@@ -28,11 +30,14 @@ logger = logging.getLogger(__name__)
 
 
 # GBNF grammars for llama.cpp backend (Linux/Mac only)
+#
+# Single-key schema: there is no SQL phase anymore (see rulebase.md's
+# ARCHITECTURE NOTE). Table selection and data loading both happen in
+# deterministic Python before the analyst is ever called (see analyst_node
+# in nodes.py) — the model only ever writes the pandas analysis code.
 GRAMMAR_ANALYST = r'''
 root ::= output
-output ::= "{" ws "\"sql\"" ws ":" ws oneline_string ws "," ws "\"python\"" ws ":" ws string ws "," ws "\"language\"" ws ":" ws "\"python\"" ws "}"
-oneline_string ::= "\"" oneline_char* "\""
-oneline_char ::= [a-zA-Z0-9 .,;:='*()_<>!@#$%^&+/-] | "\\" (["\\/bfnrt] | "u" [0-9a-fA-F]{4})
+output ::= "{" ws "\"python\"" ws ":" ws string ws "," ws "\"language\"" ws ":" ws "\"python\"" ws "}"
 string ::= "\"" char* "\""
 char ::= [^"\\] | "\\" (["\\/bfnrt] | "u" [0-9a-fA-F]{4})
 ws ::= [ \t\n]*
@@ -461,6 +466,30 @@ class ModelClient:
             prompt = _format_ministral_prompt(augmented_messages)
             logger.debug("Generated prompt length: %d chars", len(prompt))
 
+            # Token-budget check: nothing previously measured the actual
+            # prompt against n_ctx, so a prompt that ran over the limit
+            # (e.g. a large schema_summary plus retry context) would be
+            # silently truncated by llama.cpp -- most likely from the
+            # front, which is exactly where the system prompt (rulebase
+            # instructions) lives. Make that visible instead of invisible.
+            try:
+                n_ctx = self.model.n_ctx()
+                prompt_tokens = self.model.tokenize(prompt.encode('utf-8'), add_bos=True)
+                prompt_len = len(prompt_tokens)
+                if prompt_len + max_tokens > n_ctx:
+                    logger.warning(
+                        "Prompt (%d tokens) + max_tokens (%d) exceeds n_ctx (%d) by "
+                        "%d tokens -- content will be truncated, most likely from the "
+                        "start of the system prompt (the rulebase). Shrink schema_summary "
+                        "or the retry context, or raise MODEL_N_CTX.",
+                        prompt_len, max_tokens, n_ctx, prompt_len + max_tokens - n_ctx,
+                    )
+                else:
+                    logger.debug("Prompt token budget OK: %d + %d <= %d (n_ctx)",
+                                 prompt_len, max_tokens, n_ctx)
+            except Exception as e:
+                logger.debug("Could not check prompt token budget: %s", e)
+
             # Platform-specific grammar handling
             from llama_cpp import LlamaGrammar
 
@@ -508,7 +537,7 @@ class ModelClient:
             except json.JSONDecodeError as e:
                 logger.error("Failed to parse JSON: %s, raw: %s", e, raw_response)
                 # Fallback: extract fields via regex
-                fallback_result = _extract_json_fields_regex(raw_response, ['code', 'language', 'next', 'reason', 'action', 'feedback', 'sql', 'python'])
+                fallback_result = _extract_json_fields_regex(raw_response, ['code', 'language', 'next', 'reason', 'action', 'feedback', 'python'])
                 if fallback_result:
                     logger.info("Regex fallback succeeded, extracted: %s", fallback_result)
                     return fallback_result
@@ -541,8 +570,10 @@ class ModelClient:
 
     def analyst_generate(self, system_prompt: str, context: str) -> Dict[str, Any]:
         """
-        Generate Analyst agent output.
-        FIX E: SQL is forced to single line by grammar.
+        Generate Analyst agent output — Python only. `context` (built by
+        analyst_node) already tells the model which table is loaded into
+        `df` and shows only that table's schema; there is no 'table' or
+        'sql' field for the model to fill in.
         """
         if self.model is None:
             raise RuntimeError("Model not loaded")
@@ -554,12 +585,12 @@ class ModelClient:
 
         result = self.generate_structured(
             messages=messages,
-            output_schema='{"sql": "single line SQL", "python": "pandas code", "language": "python"}',
+            output_schema='{"python": "pandas code", "language": "python"}',
             grammar=GRAMMAR_ANALYST,
             max_tokens=1024,   # was defaulting to 256
             temperature=0.2,
         )
-        logger.info("Analyst generated: sql=%s, python=%s", result.get('sql', '')[:100], result.get('python', '')[:100])
+        logger.info("Analyst generated: python=%s", result.get('python', '')[:100])
         return result
 
     def generate_code(

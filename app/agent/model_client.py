@@ -461,6 +461,30 @@ class ModelClient:
             prompt = _format_ministral_prompt(augmented_messages)
             logger.debug("Generated prompt length: %d chars", len(prompt))
 
+            # Token-budget check: nothing previously measured the actual
+            # prompt against n_ctx, so a prompt that ran over the limit
+            # (e.g. a large schema_summary plus retry context) would be
+            # silently truncated by llama.cpp -- most likely from the
+            # front, which is exactly where the system prompt (rulebase
+            # instructions) lives. Make that visible instead of invisible.
+            try:
+                n_ctx = self.model.n_ctx()
+                prompt_tokens = self.model.tokenize(prompt.encode('utf-8'), add_bos=True)
+                prompt_len = len(prompt_tokens)
+                if prompt_len + max_tokens > n_ctx:
+                    logger.warning(
+                        "Prompt (%d tokens) + max_tokens (%d) exceeds n_ctx (%d) by "
+                        "%d tokens -- content will be truncated, most likely from the "
+                        "start of the system prompt (the rulebase). Shrink schema_summary "
+                        "or the retry context, or raise MODEL_N_CTX.",
+                        prompt_len, max_tokens, n_ctx, prompt_len + max_tokens - n_ctx,
+                    )
+                else:
+                    logger.debug("Prompt token budget OK: %d + %d <= %d (n_ctx)",
+                                 prompt_len, max_tokens, n_ctx)
+            except Exception as e:
+                logger.debug("Could not check prompt token budget: %s", e)
+
             # Platform-specific grammar handling
             from llama_cpp import LlamaGrammar
 

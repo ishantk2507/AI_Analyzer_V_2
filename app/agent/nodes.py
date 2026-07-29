@@ -8,6 +8,14 @@ FIXES APPLIED:
    - Injects 'df' into sandbox for Python execution.
 2. Thinker Node: Fixed guardrail ordering. Max iterations now forces 'report' explicitly.
 3. Report Node: Removed hallucinated follow-up questions. Strictly summarizes findings.
+4. Analyst Node: Retry context now echoes the previous SQL/Python back to the
+   model alongside the error feedback, so it has something concrete to
+   diverge from instead of regenerating the same mistake blind.
+5. Rulebase: split into role-scoped '##' sections via get_rulebase_section().
+   Each agent now receives only its own instructions instead of the entire
+   file concatenated together — critical on a 4096-token model, where the
+   old approach spent ~1700+ tokens of system prompt per call regardless of
+   which agent was calling.
 """
 
 import json
@@ -93,6 +101,56 @@ def get_agent_max_iterations() -> int:
     rulebase = get_rulebase()
     return _parse_max_iterations(rulebase)
 
+
+def _parse_rulebase_sections(rulebase_text: str) -> Dict[str, str]:
+    """
+    Split the rulebase into named sections keyed by their '## name' header.
+
+    Content before the first '##' header (title + preamble) is intentionally
+    dropped here — it's documentation for humans editing the file, never
+    meant to be sent to the model. A '###' sub-heading (e.g. "### Column
+    Disambiguation") does NOT start a new top-level section; it stays inside
+    whichever '##' section it's nested under.
+    """
+    sections: Dict[str, str] = {}
+    current_name: Optional[str] = None
+    current_lines: List[str] = []
+    for line in rulebase_text.split('\n'):
+        m = re.match(r'^##\s+(\S+)\s*$', line.strip())
+        if m:
+            if current_name:
+                sections[current_name] = '\n'.join(current_lines).strip()
+            current_name = m.group(1).strip().lower()
+            current_lines = []
+        elif current_name:
+            current_lines.append(line)
+    if current_name:
+        sections[current_name] = '\n'.join(current_lines).strip()
+    return sections
+
+
+def get_rulebase_section(*names: str) -> str:
+    """
+    Return only the named section(s) of the rulebase, concatenated in the
+    order given. This — NOT get_rulebase() — is what should be sent as the
+    system prompt for a specific agent role: each role gets just its own
+    instructions instead of every other role's prompt along with it, which
+    matters a lot on a 4096-token model where the system prompt competes
+    with the schema context and the completion budget for the same window.
+
+    get_rulebase() (whole raw file) still exists and is still used for the
+    max-iterations regex lookup, since that value isn't role-scoped.
+    """
+    sections = _parse_rulebase_sections(get_rulebase())
+    parts = []
+    for name in names:
+        key = name.strip().lower()
+        if key in sections:
+            parts.append(sections[key])
+        else:
+            logger.warning("Rulebase section '%s' not found in rulebase.md", name)
+    return '\n\n'.join(parts)
+
 def _extract_digit_starting_columns(data_profile: Optional[Dict[str, Any]]) -> List[str]:
     """Extract column names that start with digits from the data profile."""
     digit_cols = []
@@ -106,6 +164,101 @@ def _extract_digit_starting_columns(data_profile: Optional[Dict[str, Any]]) -> L
                 if col_name and col_name[0].isdigit():
                     digit_cols.append(col_name)
     return digit_cols
+
+
+# Keyword -> subtype codes that must be SELECTed and SUMed together. Keep this
+# in sync with the "SUBTYPE COLUMN GROUPS" block in rulebase.md's COLUMN
+# GLOSSARY — that's the source of truth for a human reading the rulebase;
+# this is the same rule re-expressed so it can be injected dynamically,
+# right next to the query, rather than only living in the static system
+# prompt where it competes with the schema block for the model's attention
+# and is the first thing to fall out of a near-full context window.
+_CATEGORY_SUBTYPE_GROUPS: List[tuple] = [
+    (r'\btwo[\s-]*wheel', ['2WT', '2WN', '2WIC'], 'Two Wheeler'),
+    (r'\bthree[\s-]*wheel', ['3WT', '3WN'], 'Three Wheeler'),
+]
+
+
+def _category_group_hint(query: str, table_columns: Dict[str, List[str]]) -> str:
+    """
+    If the query names a broad category that maps to more than one subtype
+    column on the table(s) actually in play, return a concrete SELECT-all
+    reminder. Only fires when 2+ of the group's codes are real columns here
+    (so it stays silent on tables that don't have this subtype split).
+    """
+    all_cols = {c for cols in table_columns.values() for c in cols}
+    hints = []
+    for pattern, codes, label in _CATEGORY_SUBTYPE_GROUPS:
+        if not re.search(pattern, query, re.IGNORECASE):
+            continue
+        present = [c for c in codes if c in all_cols]
+        if len(present) > 1:
+            quoted = ' + '.join(f'"{c}"' for c in present)
+            hints.append(
+                f'NOTE: the query asks about "{label}". On this table that total is '
+                f'{quoted} SUMMED together. Your SQL SELECT list must include ALL of '
+                f'{present} — selecting only one of them is wrong.'
+            )
+    return '\n'.join(hints)
+
+
+def _detect_missing_sql_columns(state: AgentState) -> Optional[str]:
+    """
+    Detect a specific, previously-unhandled failure mode: the Python phase
+    raised a KeyError on a column name that IS a real column in the live
+    schema, but the SQL SELECT list simply didn't include it (e.g. Python
+    does df.groupby(['STATE', 'YEAR']) but the SQL only selected "2WT").
+    This is neither "the column doesn't exist" (already handled by
+    _validate_and_fix_columns / the is_column_error branch below) nor a
+    genuine Python logic bug (the generic 'analyze' feedback) — it's a
+    mismatch between what the SQL fetched and what the Python code assumes
+    it fetched. Returns a concrete diagnosis naming the exact missing
+    column(s) and what the SQL actually returned, or None if this pattern
+    doesn't apply.
+    """
+    execution_result = state.get('execution_result') or {}
+    err = str(execution_result.get('error') or '')
+    m = re.search(r"KeyError:\s*'([^']+)'", err)
+    if not m:
+        return None
+    missing_col = m.group(1)
+
+    # The sandbox bootstrap always prints the actual columns it received
+    # (see analyst_node's `schema_check`) — read that back rather than
+    # re-deriving it from the SQL text, since it reflects what actually
+    # reached pandas.
+    stdout = execution_result.get('stdout', '') or ''
+    cols_match = re.search(r"COLUMNS:\s*(\[[^\]]*\])", stdout)
+    returned_cols: List[str] = []
+    if cols_match:
+        try:
+            returned_cols = eval(cols_match.group(1), {"__builtins__": {}})
+        except Exception:
+            returned_cols = []
+
+    if missing_col in returned_cols:
+        return None  # column WAS returned — some other kind of KeyError
+
+    # Only blame the SQL if the missing name is a real column somewhere in
+    # the live schema — otherwise this is a typo/hallucinated name, which
+    # is a different problem the generic branch already covers.
+    data_profile = state.get('data_profile') or {}
+    is_real_column = any(
+        any(c.get('name') == missing_col for c in profile.get('columns', []))
+        for profile in data_profile.values()
+        if isinstance(profile, dict)
+    )
+    if not is_real_column:
+        return None
+
+    return (
+        "YOUR SQL DID NOT SELECT A COLUMN YOUR PYTHON CODE NEEDS. "
+        f"Your SQL only returned these columns: {returned_cols or '(unknown)'}. "
+        f"Your Python code references '{missing_col}', which is a real column but was "
+        f"left out of the SQL SELECT list. Rewrite the SQL to also SELECT \"{missing_col}\" "
+        f"(keep it quoted if it starts with a digit). Do not rename or guess a different "
+        f"column — '{missing_col}' is correct, it just needs to be added to SELECT."
+    )
 
 
 def thinker_node(state: AgentState, model_client: ModelClient) -> AgentState:
@@ -133,6 +286,14 @@ def thinker_node(state: AgentState, model_client: ModelClient) -> AgentState:
         if res:
             context_parts.append(f"Last Result: {res[:200]}")
 
+    # Give the thinker the real diagnosis (not just the raw truncated
+    # traceback) when we can determine one deterministically — it has been
+    # observed inventing a plausible-sounding but factually wrong reason
+    # otherwise (e.g. blaming a rename(column) typo that wasn't in the code).
+    missing_cols_diagnosis = _detect_missing_sql_columns(state)
+    if missing_cols_diagnosis:
+        context_parts.append(f"Diagnosis: {missing_cols_diagnosis}")
+
     if state.get('generated_code'):
         code = state['generated_code']
         if isinstance(code, dict):
@@ -145,7 +306,7 @@ def thinker_node(state: AgentState, model_client: ModelClient) -> AgentState:
 
     # Call LLM
     try:
-        rulebase = get_rulebase()
+        rulebase = get_rulebase_section('thinker_system_prompt')
         decision = model_client.thinker_decide(rulebase, context)
         logger.info("=== THINKER RAW OUTPUT ===\n%s", decision)
     except Exception as e:
@@ -176,8 +337,42 @@ def thinker_node(state: AgentState, model_client: ModelClient) -> AgentState:
     feedback = None
     if action in ('extract', 'analyze') and iteration < max_iterations:
         last_error = (state.get('execution_result') or {}).get('error', '')
+        err_str_top = str(last_error) if last_error else ''
 
-        if action == 'extract':
+        # A crashed/killed sandbox process is never a schema or column
+        # problem — it means the query loaded or materialized far more data
+        # than it needed to (e.g. SELECT * across many wide string columns,
+        # then .to_dict('records') on the full un-aggregated table). This is
+        # checked before the extract/analyze branches below regardless of
+        # which action the thinker picked, because it has been observed
+        # choosing 'extract' and inventing a plausible-sounding schema fix
+        # (e.g. "table is missing STATE/YEAR") for what was actually a crash
+        # — the crashed table printed right above the claim clearly had
+        # those columns. Don't let a wrong action choice lose this signal.
+        if (
+            'terminated unexpectedly' in err_str_top
+            or 'Failed to write to sandbox' in err_str_top
+            or 'Failed to read from sandbox' in err_str_top
+        ):
+            feedback = (
+                "SANDBOX CRASHED. This is a resource/memory problem, not a "
+                "schema problem — do not rename or guess at column names. "
+                "The likely cause is loading too much data at once: SELECT "
+                "only the specific columns the query needs (never SELECT *), "
+                "and aggregate or filter down to a small result BEFORE "
+                "calling to_dict(), to_dict('records'), or similar on the "
+                "DataFrame."
+            )
+        elif missing_cols_diagnosis:
+            # Deterministic override: this specific failure has a known,
+            # concrete fix (add the column to SELECT). Don't let the generic
+            # 'analyze' branch below reduce it to a vague "Code failed:
+            # KeyError... Fix the error." message, and don't let a
+            # misclassified action route it to the wrong feedback branch —
+            # force it to 'extract' since the fix is in the SQL.
+            feedback = missing_cols_diagnosis
+            action = 'extract'
+        elif action == 'extract':
             err_str = str(last_error) if last_error else ''
             zero_rows_hint = (state.get('execution_result') or {}).get('zero_rows_hint')
 
@@ -339,6 +534,42 @@ def _validate_and_fix_columns(sql: str, table_columns: Dict[str, List[str]]) -> 
     return parsed.sql(dialect='duckdb'), None
 
 
+def _validate_no_aggregation(sql: str) -> Optional[str]:
+    """
+    The rulebase requires SQL to be extraction-only (filter + select) —
+    all aggregation happens in the Python phase. The model has been
+    observed adding GROUP BY on retry when told to fix a Python KeyError
+    (reaching for aggregation instead of the actual fix: adding a missing
+    column to SELECT). Reject that deterministically here, before it hits
+    DuckDB as a Binder Error and burns another iteration, with a message
+    that points at the real fix.
+    """
+    try:
+        parsed = sqlglot.parse_one(sql, read='duckdb')
+    except Exception:
+        return None  # unparseable — let DuckDB's own error surface normally
+
+    if parsed.find(exp.Group):
+        return (
+            "SQL contains GROUP BY, which is not allowed — this phase is extraction "
+            "only (filter + select). Remove GROUP BY entirely. If a KeyError sent you "
+            "here, the real fix is almost always to add the missing column(s) to your "
+            "SELECT list, not to aggregate in SQL. All grouping/aggregation belongs in "
+            "the Python phase using df.groupby(...)."
+        )
+
+    agg_funcs = list(parsed.find_all(exp.AggFunc))
+    if agg_funcs:
+        names = sorted({type(f).__name__ for f in agg_funcs})
+        return (
+            f"SQL contains aggregate function(s) {names}, which is not allowed — this "
+            "phase is extraction only (filter + select). Move aggregation to the "
+            "Python phase using pandas."
+        )
+
+    return None
+
+
 def _build_zero_row_hint(sql: str, data_profile: Dict[str, Any]) -> str:
     """
     The SQL ran fine but matched no rows — almost always a wrong filter
@@ -412,7 +643,7 @@ def _auto_close_brackets(code: str) -> str:
                     stack.append(tok.string)
                 elif tok.string in closers and stack and stack[-1] == closers[tok.string]:
                     stack.pop()
-    except (tokenize.TokenizeError, IndentationError):
+    except (tokenize.TokenError, IndentationError):
         pass
     if not stack:
         return code
@@ -497,6 +728,15 @@ def analyst_node(state: AgentState, model_client: ModelClient, sandbox: SandboxC
         quoted_list = ', '.join([f'"{c}"' for c in digit_cols])
         quoting_rule = f"\nMUST QUOTE THESE COLUMNS IN SQL: {quoted_list}\n"
 
+    # Computed early (not just post-generation) so it can also feed the
+    # category-group hint below — both uses are pure functions of the live
+    # schema, not of anything the model just generated.
+    data_profile = state.get('data_profile') or {}
+    table_columns = {
+        t: [c['name'] for c in data_profile[t].get('columns', [])]
+        for t in table_names if t in data_profile
+    }
+
     # Build Context
     context_parts = []
     if state.get('analyst_feedback'):
@@ -527,15 +767,24 @@ def analyst_node(state: AgentState, model_client: ModelClient, sandbox: SandboxC
         table_manifest,
         quoting_rule,
     ]
+    if state.get('schema_summary'):
+        context_parts.append(f"Schema:\n{state['schema_summary']}")
 
+    # Dynamic, per-query reminder placed immediately before the query text —
+    # see _category_group_hint docstring for why this isn't left to the
+    # static COLUMN GLOSSARY alone.
+    category_hint = _category_group_hint(state['query'], table_columns)
+    if category_hint:
+        context_parts.append(category_hint)
 
+    context_parts.append(f"Query: {state['query']}")
 
     context = "\n".join(context_parts)
     logger.info("=== ANALYST PROMPT CONTEXT ===\n%s", context[:1000])
 
     # CALL ANALYST GENERATE (Two-Phase Schema)
     try:
-        rulebase = get_rulebase()
+        rulebase = get_rulebase_section('dataset_manifest', 'analyst_system_prompt')
         result = model_client.analyst_generate(rulebase, context)
         logger.info("=== ANALYST RAW OUTPUT ===\n%s", result)
     except Exception as e:
@@ -565,14 +814,8 @@ def analyst_node(state: AgentState, model_client: ModelClient, sandbox: SandboxC
         sql = re.sub(rf'(?<!")\b{re.escape(col)}\b(?!")', f'"{col}"', sql)
 
     # NEW: validate every referenced column against the live schema.
-    # Defensive .get() chain — if profiling failed for a table (data_profile
-    # entry is {'error': ...} instead of {'columns': [...]}), that table
-    # just contributes no columns rather than crashing the whole node.
-    data_profile = state.get('data_profile') or {}
-    table_columns = {
-        t: [c['name'] for c in data_profile[t].get('columns', [])]
-        for t in table_names if t in data_profile
-    }
+    # (table_columns and data_profile were already computed above, before
+    # the LLM call, so the category hint could use them too.)
     sql, column_error = _validate_and_fix_columns(sql, table_columns)
     if column_error:
         logger.warning("Column validation failed: %s", column_error)
@@ -581,6 +824,19 @@ def analyst_node(state: AgentState, model_client: ModelClient, sandbox: SandboxC
             'execution_result': {'error': column_error},
             'findings': f"SQL references invalid column(s): {column_error}",
             'errors': state.get('errors', []) + [column_error],
+            'success': False,
+        }
+
+    # NEW: reject SQL that violates the extraction-only rule (GROUP BY /
+    # aggregate functions) — see _validate_no_aggregation for why.
+    aggregation_error = _validate_no_aggregation(sql)
+    if aggregation_error:
+        logger.warning("SQL aggregation check failed: %s", aggregation_error)
+        return {
+            'generated_code': {'sql': sql, 'python': python_code},
+            'execution_result': {'error': aggregation_error},
+            'findings': f"SQL violates extraction-only rule: {aggregation_error}",
+            'errors': state.get('errors', []) + [aggregation_error],
             'success': False,
         }
 
@@ -789,7 +1045,7 @@ def viz_node(state: AgentState, model_client: ModelClient, sandbox: SandboxClien
 
     data_context = "Use matplotlib for plotting. Save figures to /scratch/ directory."
 
-    rulebase = get_rulebase()
+    rulebase = get_rulebase_section('viz_system_prompt')
     code_result = model_client.generate_code(rulebase, task_description, data_context)
     logger.info("Viz model response: %s", code_result)
 
@@ -852,7 +1108,7 @@ def report_node(state: AgentState, model_client: ModelClient) -> AgentState:
 
     # Generate response (No follow-up questions instruction)
     try:
-        rulebase = get_rulebase()
+        rulebase = get_rulebase_section('report_system_prompt')
         response = model_client.generate_response(
             system_prompt=rulebase,
             query=query,
